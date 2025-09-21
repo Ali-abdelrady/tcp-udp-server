@@ -66,7 +66,7 @@ func (s *Udp) StartServer() {
 				continue
 			}
 			clientID, msg := parts[0], parts[1]
-			cmds <- serverCmd{op: 3, clientID: clientID, message: msg}
+			cmds <- serverCmd{op: OpMessage, clientID: clientID, message: msg}
 		}
 	}()
 
@@ -93,8 +93,10 @@ func (s *Udp) StartServer() {
 
 func (s *Udp) registerClient(clientID string, addr *net.UDPAddr, conn *net.UDPConn) {
 	s.clients[clientID] = addr
-	ack := fmt.Sprintf("ack register for client%s,addr:%s \n", clientID, addr.String())
-	_, err := conn.WriteToUDP([]byte(ack), addr)
+	ack := fmt.Sprintf("register ack for client%s\n", clientID)
+
+	msg := append([]byte{OpMessage}, ([]byte(ack))...)
+	_, err := conn.WriteToUDP(msg, addr)
 	if err != nil {
 		fmt.Println("\nfailed to write date to client,err: ", err)
 		return
@@ -125,7 +127,9 @@ func (s *Udp) sendMessageToClient(conn *net.UDPConn, clientID, message string) {
 		fmt.Printf("\nclient%s not found:\n", clientID)
 		return
 	}
-	_, err := conn.WriteToUDP([]byte(message), addr)
+
+	msg := append([]byte{OpMessage}, ([]byte(message))...)
+	_, err := conn.WriteToUDP(msg, addr)
 	if err != nil {
 		fmt.Printf("\nfailed to send message to %s: %v\n", addr.String(), err)
 		return
@@ -137,11 +141,11 @@ func (s *Udp) runManger(conn *net.UDPConn, cmds <-chan serverCmd) {
 	s.clients = make(map[string]*net.UDPAddr)
 	for cmd := range cmds {
 		switch cmd.op {
-		case 0: // register
+		case OpRegister: // register
 			s.registerClient(cmd.clientID, cmd.addr, conn)
-		case 1: // ping
+		case OpPing: // ping
 			go s.pingClient(cmd.clientID, cmd.addr, conn)
-		case 3: // send
+		case OpMessage: // send
 			s.sendMessageToClient(conn, cmd.clientID, cmd.message)
 		default:
 			fmt.Printf("\nunknown op %d from %s", cmd.op, cmd.addr.String())
