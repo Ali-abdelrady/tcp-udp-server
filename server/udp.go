@@ -47,6 +47,8 @@ func (s *Udp) StartServer() {
 
 	// Run the mager of the opertaion
 	cmds := make(chan serverCmd)
+	s.clients = make(map[string]*net.UDPAddr)
+
 	go s.runManger(connection, cmds)
 
 	buffer := make([]byte, 1024)
@@ -138,13 +140,12 @@ func (s *Udp) sendMessageToClient(conn *net.UDPConn, clientID, message string) {
 
 func (s *Udp) runManger(conn *net.UDPConn, cmds <-chan serverCmd) {
 
-	s.clients = make(map[string]*net.UDPAddr)
 	for cmd := range cmds {
 		switch cmd.op {
 		case OpRegister: // register
 			s.registerClient(cmd.clientID, cmd.addr, conn)
 		case OpPing: // ping
-			go s.pingClient(cmd.clientID, cmd.addr, conn)
+			s.pingClient(cmd.clientID, cmd.addr, conn)
 		case OpMessage: // send
 			s.sendMessageToClient(conn, cmd.clientID, cmd.message)
 		default:
