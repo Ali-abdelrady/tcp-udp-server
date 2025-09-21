@@ -13,6 +13,7 @@ type Udp struct {
 	AddStr  string
 	clients map[string]*net.UDPAddr
 }
+
 type serverCmd struct {
 	op       byte
 	clientID string
@@ -96,16 +97,17 @@ func (s *Udp) registerClient(clientID string, addr *net.UDPAddr, conn *net.UDPCo
 
 func (s *Udp) pingClient(clientID string, addr *net.UDPAddr, conn *net.UDPConn) {
 	s.clients[clientID] = addr
-	for i := 0; i < 4; i++ {
-		msg := fmt.Sprintf("ping %s time=%d", addr.String(), time.Now().Unix())
-		_, err := conn.WriteToUDP([]byte(msg), addr)
-		if err != nil {
-			fmt.Println("\nfailed to send ping:", err)
-			return
-		}
-		fmt.Println("\nsent:", msg)
-		time.Sleep(1 * time.Second)
+
+	msg := fmt.Sprintf("pong %s time=%d", addr.String(), time.Now().Unix())
+	_, err := conn.WriteToUDP([]byte(msg), addr)
+	if err != nil {
+		fmt.Println("\nfailed to send ping:", err)
+		return
 	}
+
+	fmt.Println("\nsent:", msg)
+	time.Sleep(1 * time.Second)
+
 }
 
 func (s *Udp) sendMessageToClient(conn *net.UDPConn, clientID, message string) {
@@ -122,6 +124,7 @@ func (s *Udp) sendMessageToClient(conn *net.UDPConn, clientID, message string) {
 }
 
 func (s *Udp) runManger(conn *net.UDPConn, cmds <-chan serverCmd) {
+
 	s.clients = make(map[string]*net.UDPAddr)
 	for cmd := range cmds {
 		switch cmd.op {
