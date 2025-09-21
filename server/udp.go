@@ -9,6 +9,13 @@ import (
 	"time"
 )
 
+const (
+	OpRegister byte = iota // 0
+	OpPing                 // 1
+	OpMessage              // 2
+	OpPong                 // 3
+)
+
 type Udp struct {
 	AddStr  string
 	clients map[string]*net.UDPAddr
@@ -99,7 +106,9 @@ func (s *Udp) pingClient(clientID string, addr *net.UDPAddr, conn *net.UDPConn) 
 	s.clients[clientID] = addr
 
 	msg := fmt.Sprintf("pong %s time=%d", addr.String(), time.Now().Unix())
-	_, err := conn.WriteToUDP([]byte(msg), addr)
+	pongMsg := append([]byte{OpPong}, ([]byte(msg))...)
+
+	_, err := conn.WriteToUDP(pongMsg, addr)
 	if err != nil {
 		fmt.Println("\nfailed to send ping:", err)
 		return
