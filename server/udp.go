@@ -266,7 +266,7 @@ func (s *Udp) sendChunkWithAck(conn *net.UDPConn, clientAddr *net.UDPAddr, packe
 				// Success Ack
 				return nil
 			}
-		case <-time.After(1 * time.Second):
+		case <-time.After(3 * time.Second):
 			fmt.Printf("Timeout waiting for ACK %d, retrying...\n", seq)
 		}
 	}
