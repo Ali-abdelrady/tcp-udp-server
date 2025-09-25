@@ -189,7 +189,11 @@ func (s *Udp) sendFileToClient(conn *net.UDPConn, clientID, filePath string) {
 				copy(packet[5:], buffer[:n])
 			}
 
-			s.sendChunkWithAck(conn, addr, packet, seq)
+			err := s.sendChunkWithAck(conn, addr, packet, seq)
+			if err != nil {
+				fmt.Println(err.Error())
+				return
+			}
 			seq++
 		}
 		if err == io.EOF {
@@ -226,10 +230,8 @@ func (s *Udp) runManger(conn *net.UDPConn, cmds <-chan serverCmd) {
 				fmt.Printf("Message ack meesage from %s: %s\n", cmd.clientID, string(cmd.data))
 			case OpFileChunk:
 				seq := binary.BigEndian.Uint32(cmd.data[1:])
-				fmt.Printf("fileChunkAck seq = %d\n", seq)
 				s.seqAckChan <- seq
 			}
-			fmt.Printf("Ack meesage from %s: %s\n", cmd.clientID, string(cmd.data))
 		// case
 		default:
 			fmt.Printf("\nunknown op %d from %s", cmd.op, cmd.addr.String())
@@ -245,15 +247,14 @@ func (s *Udp) runManger(conn *net.UDPConn, cmds <-chan serverCmd) {
 // 	}
 // }
 
-func (s *Udp) sendChunkWithAck(conn *net.UDPConn, clientAddr *net.UDPAddr, packet []byte, seq uint32) {
-	maxRetries := 2
+func (s *Udp) sendChunkWithAck(conn *net.UDPConn, clientAddr *net.UDPAddr, packet []byte, seq uint32) error {
+	maxRetries := 3
 	for i := 0; i < maxRetries; i++ {
 
 		// Send the chunk
 		_, err := conn.WriteToUDP(packet, clientAddr)
 		if err != nil {
-			fmt.Println("failed to send chunk:", err)
-			return
+			return fmt.Errorf("failed to send chunk:", err)
 		}
 
 		// fmt.Println("")
@@ -262,12 +263,11 @@ func (s *Udp) sendChunkWithAck(conn *net.UDPConn, clientAddr *net.UDPAddr, packe
 		case ackSeq := <-s.seqAckChan:
 			if ackSeq == seq {
 				// Success Ack
-				return
+				return nil
 			}
 		case <-time.After(1 * time.Second):
 			fmt.Printf("Timeout waiting for ACK %d, retrying...\n", seq)
 		}
 	}
-	fmt.Printf("Failed to deliver chunk %d after retries\n", seq)
-
+	return fmt.Errorf("failed to deliver chunk %d after retries\n", seq)
 }
