@@ -230,6 +230,7 @@ func (s *Udp) runManger(conn *net.UDPConn, cmds <-chan serverCmd) {
 				fmt.Printf("Message ack meesage from %s: %s\n", cmd.clientID, string(cmd.data))
 			case OpFileChunk:
 				seq := binary.BigEndian.Uint32(cmd.data[1:])
+				fmt.Printf("Received raw ACK from %s: seq:%v\n", cmd.clientID, seq)
 				s.seqAckChan <- seq
 			}
 		// case
