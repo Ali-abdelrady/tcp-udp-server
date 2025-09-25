@@ -2,19 +2,26 @@ package server
 
 import (
 	"bufio"
+	"encoding/binary"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"strings"
 	"time"
 )
 
+// OPCODE
 const (
-	OpRegister byte = iota // 0
-	OpPing                 // 1
-	OpMessage              // 2
-	OpPong                 // 3
+	OpRegister  byte = iota // 0
+	OpPing                  // 1
+	OpMessage               // 2
+	OpPong                  // 3
+	OpFileChunk             // 4
+	OpAck
 )
+
+const CHUNKSIZE = 1015
 
 type Udp struct {
 	AddStr  string
@@ -68,7 +75,7 @@ func (s *Udp) StartServer() {
 				continue
 			}
 			clientID, msg := parts[0], parts[1]
-			cmds <- serverCmd{op: OpMessage, clientID: clientID, message: msg}
+			cmds <- serverCmd{op: OpFileChunk, clientID: clientID, message: msg}
 		}
 	}()
 
@@ -138,6 +145,57 @@ func (s *Udp) sendMessageToClient(conn *net.UDPConn, clientID, message string) {
 	}
 }
 
+func (s *Udp) sendFileToClient(conn *net.UDPConn, clientID, filePath string) {
+
+	file, err := os.Open(filePath)
+	if err != nil {
+		fmt.Println("falied to open file with path: ", filePath)
+		return
+	}
+	defer file.Close()
+
+	addr := s.clients[clientID]
+
+	// Get file size
+	stat, _ := file.Stat()
+	fileSize := stat.Size()
+
+	// Build meta
+	buffer := make([]byte, CHUNKSIZE)
+	seq := uint32(0)
+
+	for {
+		n, err := file.Read(buffer)
+		if n > 0 {
+			var packet []byte
+			if seq == 0 {
+				// First Packet
+				packet = make([]byte, 1+4+4+n)
+				packet[0] = byte(OpFileChunk)
+				binary.BigEndian.PutUint32(packet[1:], uint32(fileSize))
+				binary.BigEndian.PutUint32(packet[5:], seq)
+				copy(packet[9:], buffer[:n])
+			} else {
+				packet = make([]byte, 1+4+n)
+				packet[0] = byte(OpFileChunk)
+				binary.BigEndian.PutUint32(packet[1:], seq)
+				copy(packet[5:], buffer[:n])
+			}
+
+			s.sendDataToClient(conn, addr, packet)
+			seq++
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			fmt.Println("failed to read files")
+			return
+		}
+	}
+	fmt.Printf("File sent successfully. Size: %.2f KB\n", float64(fileSize)/1024)
+}
+
 func (s *Udp) runManger(conn *net.UDPConn, cmds <-chan serverCmd) {
 
 	for cmd := range cmds {
@@ -148,8 +206,21 @@ func (s *Udp) runManger(conn *net.UDPConn, cmds <-chan serverCmd) {
 			s.pingClient(cmd.clientID, cmd.addr, conn)
 		case OpMessage: // send
 			s.sendMessageToClient(conn, cmd.clientID, cmd.message)
+		case OpFileChunk: // send
+			s.sendFileToClient(conn, cmd.clientID, "./message.txt")
+		case OpAck:
+			fmt.Printf("Ack meesage from %s: %s\n", cmd.clientID, cmd.message)
+		// case
 		default:
 			fmt.Printf("\nunknown op %d from %s", cmd.op, cmd.addr.String())
 		}
+	}
+}
+
+func (s *Udp) sendDataToClient(conn *net.UDPConn, clientAddr *net.UDPAddr, data []byte) {
+	_, err := conn.WriteToUDP(data, clientAddr)
+	if err != nil {
+		fmt.Printf("\nfailed to send message to %s: %v\n", clientAddr.String(), err)
+		return
 	}
 }
