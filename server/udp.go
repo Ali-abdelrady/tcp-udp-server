@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/binary"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"net"
 	"os"
@@ -24,9 +25,9 @@ const (
 const CHUNKSIZE = 1015
 
 type Udp struct {
-	AddStr     string
-	clients    map[string]*net.UDPAddr
-	seqAckChan chan uint32
+	AddStr       string
+	clients      map[string]*net.UDPAddr
+	chunkAckChan chan []byte
 }
 
 type serverCmd struct {
@@ -56,7 +57,7 @@ func (s *Udp) StartServer() {
 	// Run the mager of the opertaion
 	cmds := make(chan serverCmd)
 	s.clients = make(map[string]*net.UDPAddr)
-	s.seqAckChan = make(chan uint32, 100)
+	s.chunkAckChan = make(chan []byte, 100)
 
 	go s.runManger(connection, cmds)
 
@@ -175,21 +176,27 @@ func (s *Udp) sendFileToClient(conn *net.UDPConn, clientID, filePath string) {
 		if n > 0 {
 
 			var packet []byte
+			var dataOffset int
+
 			if seq == 0 {
 				// First Packet
 				packet = make([]byte, 1+4+4+n)
 				packet[0] = byte(OpFileChunk)
-				binary.BigEndian.PutUint32(packet[1:], uint32(fileSize))
-				binary.BigEndian.PutUint32(packet[5:], seq)
+				binary.BigEndian.PutUint32(packet[1:5], uint32(fileSize))
+				binary.BigEndian.PutUint32(packet[5:9], seq)
 				copy(packet[9:], buffer[:n])
+				dataOffset = 9
 			} else {
 				packet = make([]byte, 1+4+n)
 				packet[0] = byte(OpFileChunk)
-				binary.BigEndian.PutUint32(packet[1:], seq)
+				binary.BigEndian.PutUint32(packet[1:5], seq)
 				copy(packet[5:], buffer[:n])
+				dataOffset = 5
 			}
 
-			err := s.sendChunkWithAck(conn, addr, packet, seq)
+			chunkBytes := packet[dataOffset : dataOffset+n]
+			chunkCheckSum := crc32.ChecksumIEEE(chunkBytes)
+			err := s.sendChunkWithAck(conn, addr, packet, seq, chunkCheckSum)
 			if err != nil {
 				fmt.Println(err.Error())
 				return
@@ -208,7 +215,6 @@ func (s *Udp) sendFileToClient(conn *net.UDPConn, clientID, filePath string) {
 }
 
 func (s *Udp) runManger(conn *net.UDPConn, cmds <-chan serverCmd) {
-
 	for cmd := range cmds {
 		switch cmd.op {
 		case OpRegister: // register
@@ -229,9 +235,7 @@ func (s *Udp) runManger(conn *net.UDPConn, cmds <-chan serverCmd) {
 			case OpMessage: // send
 				fmt.Printf("Message ack meesage from %s: %s\n", cmd.clientID, string(cmd.data))
 			case OpFileChunk:
-				seq := binary.BigEndian.Uint32(cmd.data[1:])
-				fmt.Printf("Received raw ACK from %s: seq:%v\n", cmd.clientID, seq)
-				s.seqAckChan <- seq
+				s.chunkAckChan <- cmd.data[1:]
 			}
 		// case
 		default:
@@ -248,27 +252,42 @@ func (s *Udp) runManger(conn *net.UDPConn, cmds <-chan serverCmd) {
 // 	}
 // }
 
-func (s *Udp) sendChunkWithAck(conn *net.UDPConn, clientAddr *net.UDPAddr, packet []byte, seq uint32) error {
+func (s *Udp) sendChunkWithAck(conn *net.UDPConn, clientAddr *net.UDPAddr, packet []byte, seq uint32, checkSum uint32) error {
+
 	maxRetries := 3
+
 	for i := 0; i < maxRetries; i++ {
 
 		// Send the chunk
 		_, err := conn.WriteToUDP(packet, clientAddr)
 		if err != nil {
-			return fmt.Errorf("failed to send chunk:", err)
+			return fmt.Errorf("failed to send chunk: %v", err)
 		}
 
-		// fmt.Println("")
 		// Wait for the ack
 		select {
-		case ackSeq := <-s.seqAckChan:
-			if ackSeq == seq {
-				// Success Ack
+		case chunkAck := <-s.chunkAckChan:
+
+			if len(chunkAck) < 8 {
+				fmt.Printf("received short ACK from %s (len=%d)\n", clientAddr.String(), len(chunkAck))
+				// treat as missing ACK => retry
+				continue
+			}
+
+			ackseq := binary.BigEndian.Uint32(chunkAck[0:4])
+			ackCheckSum := binary.BigEndian.Uint32(chunkAck[4:8])
+
+			if seq == ackseq && checkSum == ackCheckSum {
+				// fmt.Printf("Received raw ACK from %s: seq:%v with checkSum:%d \n", clientAddr.String(), seq, checkSum)
 				return nil
+			} else {
+				fmt.Printf("ACK mismatch from %s: got seq=%d checksum=%d; want seq=%d checksum=%d\n",
+					clientAddr.String(), ackseq, ackCheckSum, seq, checkSum)
+				// retry
 			}
 		case <-time.After(3 * time.Second):
 			fmt.Printf("Timeout waiting for ACK %d, retrying...\n", seq)
 		}
 	}
-	return fmt.Errorf("failed to deliver chunk %d after retries\n", seq)
+	return fmt.Errorf("failed to deliver chunk %d after retries", seq)
 }
