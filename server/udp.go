@@ -196,11 +196,7 @@ func (s *Udp) sendFileToClient(conn *net.UDPConn, clientID, filePath string) {
 
 			chunkBytes := packet[dataOffset : dataOffset+n]
 			chunkCheckSum := crc32.ChecksumIEEE(chunkBytes)
-			err := s.sendChunkWithAck(conn, addr, packet, seq, chunkCheckSum)
-			if err != nil {
-				fmt.Println(err.Error())
-				return
-			}
+			go s.sendChunkWithAck(conn, addr, packet, seq, chunkCheckSum)
 			seq++
 		}
 		if err == io.EOF {
