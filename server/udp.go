@@ -28,7 +28,7 @@ type Udp struct {
 
 const (
 	BUFFER_SIZE = 65507
-	CHUNKSIZE   = 65450
+	CHUNKSIZE   = 2000
 )
 
 // OPCODES
@@ -67,7 +67,7 @@ func (s *Udp) StartServer() {
 	s.pendingAck = make(map[uint32]chan bool)
 
 	// Run Workers
-	for i := 0; i < 3; i++ {
+	for i := 0; i < 4; i++ {
 		go s.parserWorker()
 		go s.writeWorker(connection)
 		go s.generatorWorker()
