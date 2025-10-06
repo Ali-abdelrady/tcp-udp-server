@@ -4,15 +4,34 @@ import (
 	"bufio"
 	"encoding/binary"
 	"fmt"
-	"hash/crc32"
+	"hole-punching-v2/models"
+	"hole-punching-v2/server/utils"
+	"hole-punching-v2/server/workers"
 	"io"
 	"net"
 	"os"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
-// OPCODE
+type Udp struct {
+	Port         string
+	parserChan   chan models.RawPacket
+	writeChan    chan models.Packet
+	generateChan chan models.Packet
+	clientManger workers.ClientManager
+	pendingAck   map[uint32]chan bool
+	pendingMutex sync.Mutex
+}
+
+const (
+	BUFFER_SIZE = 65507
+	CHUNKSIZE   = 65450
+)
+
+// OPCODES
 const (
 	OpRegister  byte = iota // 0
 	OpPing                  // 1
@@ -20,26 +39,12 @@ const (
 	OpPong                  // 3
 	OpFileChunk             // 4
 	OpAck                   //5
+	OpDownload              //6
 )
-
-const CHUNKSIZE = 1015
-
-type Udp struct {
-	AddStr       string
-	clients      map[string]*net.UDPAddr
-	chunkAckChan chan []byte
-}
-
-type serverCmd struct {
-	op       byte
-	clientID string
-	data     []byte
-	addr     *net.UDPAddr
-}
 
 func (s *Udp) StartServer() {
 	// Resolve a udp addr
-	udpAddr, err := net.ResolveUDPAddr("udp4", s.AddStr)
+	udpAddr, err := net.ResolveUDPAddr("udp4", s.Port)
 	if err != nil {
 		fmt.Println("falied to resolve udp address,err: ", err)
 		os.Exit(1)
@@ -52,111 +57,253 @@ func (s *Udp) StartServer() {
 		os.Exit(1)
 	}
 	defer connection.Close()
-	fmt.Printf("%s server listening on addr %s \n", "udp", s.AddStr)
+	fmt.Printf("✅ server listening on addr %s \n", s.Port)
 
-	// Run the mager of the opertaion
-	cmds := make(chan serverCmd)
-	s.clients = make(map[string]*net.UDPAddr)
-	s.chunkAckChan = make(chan []byte, 100)
+	// Initialize Channel and workers
+	s.writeChan = make(chan models.Packet, 50)
+	s.parserChan = make(chan models.RawPacket, 50)
+	s.generateChan = make(chan models.Packet, 50)
+	s.clientManger = *workers.NewClientManager()
+	s.pendingAck = make(map[uint32]chan bool)
 
-	go s.runManger(connection, cmds)
+	// Run Workers
+	for i := 0; i < 3; i++ {
+		go s.parserWorker()
+		go s.writeWorker(connection)
+		go s.generatorWorker()
+	}
 
-	buffer := make([]byte, 1024)
+	go s.startInteractiveCommandInput()
 
-	go func() {
-		scanner := bufio.NewScanner(os.Stdin)
-		for {
-			fmt.Print("Enter clientID and message: ")
-			if !scanner.Scan() {
-				fmt.Println("input scanner closed")
-				return
-			}
-			line := scanner.Text()
-			parts := strings.SplitN(line, " ", 2)
-			if len(parts) < 2 {
-				fmt.Println("please enter: <clientID> <message>")
-				continue
-			}
-			clientID, msg := parts[0], parts[1]
-			cmds <- serverCmd{op: OpFileChunk, clientID: clientID, data: []byte(msg)}
-		}
-	}()
+	buffer := make([]byte, BUFFER_SIZE)
 
 	for {
-		n, raddr, err := connection.ReadFromUDP(buffer)
+		n, addr, err := connection.ReadFromUDP(buffer)
 		if err != nil {
 			fmt.Println("falied to read data, err: ", err)
 			continue
 		}
-		if n == 0 {
-			fmt.Println("no data to read")
+		if n < 7 {
+			fmt.Println("no data to read: n = ", n)
 			continue
 		}
 
-		op := buffer[0]
-		payload := buffer[1:n]
+		s.parserChan <- models.RawPacket{Data: buffer[:n], Addr: addr}
+	}
 
-		cmd := serverCmd{op: op, data: payload, addr: raddr}
+}
 
-		if op == OpRegister {
-			cmd.clientID = string(payload)
+func (s *Udp) writeWorker(conn *net.UDPConn) {
+	for pkt := range s.writeChan {
+		_, err := conn.WriteToUDP(pkt.Payload, pkt.Addr)
+		if err != nil {
+			fmt.Println("failed to send packet")
+		}
+	}
+}
+
+func (s *Udp) parserWorker() {
+
+	// Packet [opcode 1] [packetId 4] [clientId 2] [payload n]
+	for {
+		raw := <-s.parserChan
+
+		if len(raw.Data) < 7 {
+			continue
 		}
 
-		cmds <- cmd
-	}
+		packet := models.Packet{
+			OpCode:   raw.Data[0],
+			ID:       binary.BigEndian.Uint32(raw.Data[1:5]),
+			ClientID: binary.BigEndian.Uint16(raw.Data[5:7]),
+			Payload:  raw.Data[7:],
+			Addr:     raw.Addr,
+		}
 
-}
-
-func (s *Udp) registerClient(clientID string, addr *net.UDPAddr, conn *net.UDPConn) {
-	s.clients[clientID] = addr
-	ack := fmt.Sprintf("register ack for client%s\n", clientID)
-
-	msg := append([]byte{OpMessage}, ([]byte(ack))...)
-	_, err := conn.WriteToUDP(msg, addr)
-	if err != nil {
-		fmt.Println("\nfailed to write date to client,err: ", err)
-		return
-	}
-	fmt.Println("\nregistered client of addr:", addr.String())
-}
-
-func (s *Udp) pingClient(clientID string, addr *net.UDPAddr, conn *net.UDPConn) {
-	s.clients[clientID] = addr
-
-	msg := fmt.Sprintf("pong %s time=%d", addr.String(), time.Now().Unix())
-	pongMsg := append([]byte{OpPong}, ([]byte(msg))...)
-
-	_, err := conn.WriteToUDP(pongMsg, addr)
-	if err != nil {
-		fmt.Println("\nfailed to send ping:", err)
-		return
-	}
-
-	fmt.Println("\nsent:", msg)
-	time.Sleep(1 * time.Second)
-
-}
-
-func (s *Udp) sendMessageToClient(conn *net.UDPConn, clientID, message string) {
-	addr := s.clients[clientID]
-	if addr == nil {
-		fmt.Printf("\nclient%s not found:\n", clientID)
-		return
-	}
-
-	msg := append([]byte{OpMessage}, ([]byte(message))...)
-	_, err := conn.WriteToUDP(msg, addr)
-	if err != nil {
-		fmt.Printf("\nfailed to send message to %s: %v\n", addr.String(), err)
-		return
+		switch packet.OpCode {
+		case OpAck:
+			s.handleAck(packet)
+		case OpPing:
+			s.pingClient(packet)
+		case OpRegister:
+			s.registerClient(packet)
+			// case OpDownload:
+			// 	s.downloadFile(packet)
+		}
 	}
 }
 
-func (s *Udp) sendFileToClient(conn *net.UDPConn, clientID, filePath string) {
+func (s *Udp) generatorWorker() {
+	for {
+		packet := <-s.generateChan
 
-	file, err := os.Open(filePath)
+		// [opcode] [packetId] [payload n]
+		var packetID uint32
+
+		if packet.OpCode == OpAck {
+			// use client packetID
+			packetID = packet.ID
+		} else {
+			// Generate New one
+			packetID = utils.GenerateTimestampID()
+		}
+
+		// Packet [opcode 1] [packetId 4] [payload n]
+		buf := make([]byte, 1+4+len(packet.Payload))
+		buf[0] = packet.OpCode
+		binary.BigEndian.PutUint32(buf[1:5], packetID)
+		copy(buf[5:], packet.Payload)
+
+		// fmt.Printf("Sended Packet ID : %v\n", packetID)
+		outgoingPacket := models.Packet{Payload: buf, Addr: packet.Addr, ID: packetID, Done: packet.Done}
+
+		if packet.OpCode == OpAck {
+			// use client packetID
+			s.writeChan <- outgoingPacket
+		} else {
+			// Generate New one
+			s.sendWithAck(outgoingPacket)
+		}
+
+	}
+}
+
+func (s *Udp) startInteractiveCommandInput() {
+	scanner := bufio.NewScanner(os.Stdin)
+	for {
+		fmt.Print("Enter <clientId> <operation> <message/filepath(optional)>: ")
+		if !scanner.Scan() {
+			fmt.Println("input scanner closed")
+			return
+		}
+
+		line := scanner.Text()
+		parts := strings.SplitN(line, " ", 3)
+		if len(parts) < 2 {
+			fmt.Println("please enter: <clientId> <operation> <message/filepath(optional)>")
+			continue
+		}
+
+		clientID := parts[0]
+		operation := parts[1]
+		var payload string
+		if len(parts) == 3 {
+			payload = parts[2]
+		}
+
+		switch operation {
+		case "message":
+			if payload == "" {
+				fmt.Println("please provide a message")
+				continue
+			}
+			s.sendMessageToClient(clientID, payload)
+
+		case "file":
+			// if payload == "" {
+			// 	fmt.Println("please provide a file path")
+			// 	continue
+			// }
+			parsedClientID, err := strconv.ParseUint(clientID, 10, 16)
+			if err != nil {
+				fmt.Println("Invalid clientID input", err)
+				return
+			}
+			s.sendFileToClient(uint16(parsedClientID), "./message.txt")
+
+		default:
+			fmt.Printf("unknown operation: %s\n", operation)
+		}
+	}
+}
+
+func (s *Udp) pingClient(packet models.Packet) {
+	s.clientManger.AddClient(packet.ClientID, packet.Addr)
+
+	msg := fmt.Sprintf("Ping ack for client%d", int(packet.ClientID))
+
+	newPacket := packet
+	newPacket.OpCode = OpAck
+	newPacket.Payload = []byte(msg)
+
+	s.generateChan <- newPacket
+}
+
+func (s *Udp) registerClient(packet models.Packet) {
+
+	s.clientManger.AddClient(packet.ClientID, packet.Addr)
+
+	msg := fmt.Sprintf("register ack for client%d\n", int(packet.ClientID))
+
+	newPacket := packet
+	newPacket.OpCode = OpAck
+	newPacket.Payload = []byte(msg)
+
+	s.generateChan <- newPacket
+
+}
+
+func (s *Udp) handleAck(packet models.Packet) {
+
+	// fmt.Printf("[Server] Got ACK for packet ID = %v \n", packet.ID)
+
+	s.pendingMutex.Lock()
+	ch, ok := s.pendingAck[packet.ID]
+	s.pendingMutex.Unlock()
+
+	if ok {
+		go func(ch chan bool) { ch <- true }(ch)
+	}
+}
+
+func (s *Udp) sendWithAck(packet models.Packet) error {
+	retries := 3
+
+	internalAck := make(chan bool, 1)
+
+	s.pendingMutex.Lock()
+	s.pendingAck[packet.ID] = internalAck
+	s.pendingMutex.Unlock()
+
+	// fmt.Println("pendingAck:", s.pendingAck)
+	defer func() {
+		s.pendingMutex.Lock()
+		delete(s.pendingAck, packet.ID)
+		s.pendingMutex.Unlock()
+	}()
+
+	for i := 0; i < retries; i++ {
+
+		s.writeChan <- packet
+
+		select {
+		case <-internalAck:
+			select {
+			case packet.Done <- true:
+			default:
+			}
+			// fmt.Printf("ACK received for packet %d\n", packet.ID)
+			return nil
+		case <-time.After(4 * time.Second):
+			fmt.Printf("Timeout for packet %d, retrying...\n", packet.ID)
+		}
+	}
+
+	select {
+	case packet.Done <- false:
+	default:
+	}
+
+	return fmt.Errorf("failed to deliver packet %d", packet.ID)
+
+}
+
+func (s *Udp) sendFileToClient(clientId uint16, filepath string) {
+	// sendedSeq := []uint32{}
+
+	file, err := os.Open(filepath)
 	if err != nil {
-		fmt.Println("falied to open file with path: ", filePath)
+		fmt.Println("falied to open file with path: ", "./message")
 		return
 	}
 	defer file.Close()
@@ -168,35 +315,41 @@ func (s *Udp) sendFileToClient(conn *net.UDPConn, clientID, filePath string) {
 	// Build meta
 	buffer := make([]byte, CHUNKSIZE)
 	seq := uint32(0)
+	addr := s.clientManger.GetClient(clientId)
 
 	for {
 		n, err := file.Read(buffer)
-		addr := s.clients[clientID]
 
 		if n > 0 {
 
-			var packet []byte
-			var dataOffset int
+			offset := 4
 
 			if seq == 0 {
-				// First Packet
-				packet = make([]byte, 1+4+4+n)
-				packet[0] = byte(OpFileChunk)
-				binary.BigEndian.PutUint32(packet[1:5], uint32(fileSize))
-				binary.BigEndian.PutUint32(packet[5:9], seq)
-				copy(packet[9:], buffer[:n])
-				dataOffset = 9
-			} else {
-				packet = make([]byte, 1+4+n)
-				packet[0] = byte(OpFileChunk)
-				binary.BigEndian.PutUint32(packet[1:5], seq)
-				copy(packet[5:], buffer[:n])
-				dataOffset = 5
+				offset = 8
 			}
 
-			chunkBytes := packet[dataOffset : dataOffset+n]
-			chunkCheckSum := crc32.ChecksumIEEE(chunkBytes)
-			go s.sendChunkWithAck(conn, addr, packet, seq, chunkCheckSum)
+			// allocate enough space for header + data
+			pkt := make([]byte, offset+n)
+			binary.BigEndian.PutUint32(pkt[:4], seq)
+
+			if seq == 0 {
+				binary.BigEndian.PutUint32(pkt[4:8], uint32(fileSize))
+			}
+
+			// chunk [seq 4] [fileSize 4] [data n]
+			copy(pkt[offset:], buffer[:n])
+
+			doneChan := make(chan bool)
+
+			s.generateChan <- models.Packet{OpCode: OpFileChunk, Payload: pkt, Addr: addr, ClientID: clientId, Done: doneChan}
+
+			if seq == 0 {
+				fmt.Printf("First Seq: %v", seq)
+				if !<-doneChan {
+					break
+				}
+			}
+			// sendedSeq = append(sendedSeq, seq)
 			seq++
 		}
 		if err == io.EOF {
@@ -207,83 +360,19 @@ func (s *Udp) sendFileToClient(conn *net.UDPConn, clientID, filePath string) {
 			return
 		}
 	}
-	fmt.Printf("File sent successfully. Size: %.2f KB\n", float64(fileSize)/1024)
+	// fmt.Println("Seq:", sendedSeq)
+	fmt.Printf("File sent successfully. Size: %.2f KB\n", float64(fileSize))
 }
 
-func (s *Udp) runManger(conn *net.UDPConn, cmds <-chan serverCmd) {
-	for cmd := range cmds {
-		switch cmd.op {
-		case OpRegister: // register
-			s.registerClient(cmd.clientID, cmd.addr, conn)
-		case OpPing: // ping
-			s.pingClient(cmd.clientID, cmd.addr, conn)
-		case OpMessage: // send
-			s.sendMessageToClient(conn, cmd.clientID, string(cmd.data))
-		case OpFileChunk: // send
-			go s.sendFileToClient(conn, cmd.clientID, "./message.txt")
-		case OpAck:
-			ackType := cmd.data[0]
-			switch ackType {
-			case OpRegister: // register
-				fmt.Printf("Register ack meesage from %s: %s\n", cmd.clientID, string(cmd.data))
-			case OpPing: // ping
-				fmt.Printf("Ping ack meesage from %s: %s\n", cmd.clientID, string(cmd.data))
-			case OpMessage: // send
-				fmt.Printf("Message ack meesage from %s: %s\n", cmd.clientID, string(cmd.data))
-			case OpFileChunk:
-				s.chunkAckChan <- cmd.data[1:]
-			}
-		// case
-		default:
-			fmt.Printf("\nunknown op %d from %s", cmd.op, cmd.addr.String())
-		}
+func (s *Udp) sendMessageToClient(clientID, msg string) {
+
+	parsedClientID, err := strconv.ParseUint(clientID, 10, 16)
+	if err != nil {
+		fmt.Println("Invalid clientID input", err)
+		return
 	}
-}
 
-// func (s *Udp) sendDataToClient(conn *net.UDPConn, clientAddr *net.UDPAddr, data []byte) {
-// 	_, err := conn.WriteToUDP(data, clientAddr)
-// 	if err != nil {
-// 		fmt.Printf("\nfailed to send message to %s: %v\n", clientAddr.String(), err)
-// 		return
-// 	}
-// }
+	addr := s.clientManger.GetClient(uint16(parsedClientID))
 
-func (s *Udp) sendChunkWithAck(conn *net.UDPConn, clientAddr *net.UDPAddr, packet []byte, seq uint32, checkSum uint32) error {
-
-	maxRetries := 3
-
-	for i := 0; i < maxRetries; i++ {
-
-		// Send the chunk
-		_, err := conn.WriteToUDP(packet, clientAddr)
-		if err != nil {
-			return fmt.Errorf("failed to send chunk: %v", err)
-		}
-
-		// Wait for the ack
-		select {
-		case chunkAck := <-s.chunkAckChan:
-
-			if len(chunkAck) < 8 {
-				fmt.Printf("received short ACK from %s (len=%d)\n", clientAddr.String(), len(chunkAck))
-				// treat as missing ACK => retry
-				continue
-			}
-
-			ackseq := binary.BigEndian.Uint32(chunkAck[0:4])
-			ackCheckSum := binary.BigEndian.Uint32(chunkAck[4:8])
-
-			if seq == ackseq && checkSum == ackCheckSum {
-				// fmt.Printf("Received raw ACK from %s: seq:%v with checkSum:%d \n", clientAddr.String(), seq, checkSum)
-				return nil
-			} else {
-				fmt.Printf("ACK mismatch from %s: got seq=%d checksum=%d; want seq=%d checksum=%d\n",
-					clientAddr.String(), ackseq, ackCheckSum, seq, checkSum)
-				// retry
-			}
-		case <-time.After(3 * time.Second):
-			fmt.Printf("Timeout waiting for ACK %d, retrying...\n", seq)
-		}
-	}
-	return fmt.Errorf("failed to deliver chunk %d after retries", seq)
+	s.generateChan <- models.Packet{OpCode: OpMessage, Payload: []byte(msg), Addr: addr}
 }

@@ -1,3 +1,3 @@
-module hole-punching
+module hole-punching-v2
 
 go 1.24.0
