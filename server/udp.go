@@ -31,7 +31,7 @@ type Udp struct {
 
 const (
 	BUFFER_SIZE = 65507
-	CHUNKSIZE   = 60000
+	CHUNKSIZE   = 50000
 )
 
 // OPCODES
@@ -280,7 +280,7 @@ func (s *Udp) sendWithAck(packet models.Packet) error {
 	for i := 0; i < retries; i++ {
 
 		s.writeChan <- packet
-		time.Sleep(30 * time.Millisecond) // 👈 helps throttle sending rate
+		time.Sleep(2 * time.Millisecond) // 👈 helps throttle sending rate
 
 		select {
 		case <-ackCh:
