@@ -21,6 +21,8 @@ type Udp struct {
 	parserChan   chan models.RawPacket
 	writeChan    chan models.Packet
 	generateChan chan models.Packet
+	trackingChan chan models.Packet
+
 	clientManger workers.ClientManager
 	pendingAck   map[uint32]chan bool
 	pendingMutex sync.Mutex
@@ -28,7 +30,7 @@ type Udp struct {
 
 const (
 	BUFFER_SIZE = 65507
-	CHUNKSIZE   = 2000
+	CHUNKSIZE   = 60000
 )
 
 // OPCODES
@@ -64,6 +66,7 @@ func (s *Udp) StartServer() {
 	s.parserChan = make(chan models.RawPacket, 50)
 	s.generateChan = make(chan models.Packet, 50)
 	s.clientManger = *workers.NewClientManager()
+	s.trackingChan = make(chan models.Packet, 100)
 	s.pendingAck = make(map[uint32]chan bool)
 
 	// Run Workers
@@ -71,6 +74,7 @@ func (s *Udp) StartServer() {
 		go s.parserWorker()
 		go s.writeWorker(connection)
 		go s.generatorWorker()
+		go s.trackingWorker()
 	}
 
 	go s.startInteractiveCommandInput()
@@ -162,7 +166,7 @@ func (s *Udp) generatorWorker() {
 			s.writeChan <- outgoingPacket
 		} else {
 			// Generate New one
-			s.sendWithAck(outgoingPacket)
+			s.trackingChan <- outgoingPacket
 		}
 
 	}
@@ -209,7 +213,7 @@ func (s *Udp) startInteractiveCommandInput() {
 				fmt.Println("Invalid clientID input", err)
 				return
 			}
-			s.sendFileToClient(uint16(parsedClientID), "./message.txt")
+			s.sendFileToClient(uint16(parsedClientID), "./image.jpg")
 
 		default:
 			fmt.Printf("unknown operation: %s\n", operation)
@@ -252,7 +256,7 @@ func (s *Udp) handleAck(packet models.Packet) {
 	s.pendingMutex.Unlock()
 
 	if ok {
-		go func(ch chan bool) { ch <- true }(ch)
+		ch <- true
 	}
 }
 
@@ -278,24 +282,31 @@ func (s *Udp) sendWithAck(packet models.Packet) error {
 
 		select {
 		case <-internalAck:
-			select {
-			case packet.Done <- true:
-			default:
+			if packet.Done != nil {
+				packet.Done <- true
 			}
-			// fmt.Printf("ACK received for packet %d\n", packet.ID)
+			fmt.Printf("ACK received for packet %d\n", packet.ID)
 			return nil
 		case <-time.After(4 * time.Second):
 			fmt.Printf("Timeout for packet %d, retrying...\n", packet.ID)
 		}
 	}
 
-	select {
-	case packet.Done <- false:
-	default:
+	if packet.Done != nil {
+		packet.Done <- false
 	}
 
 	return fmt.Errorf("failed to deliver packet %d", packet.ID)
 
+}
+
+func (s *Udp) trackingWorker() {
+	for packet := range s.trackingChan {
+		err := s.sendWithAck(packet)
+		if err != nil {
+			fmt.Printf("[Tracking] Failed to deliver packet %d after retries\n", packet.ID)
+		}
+	}
 }
 
 func (s *Udp) sendFileToClient(clientId uint16, filepath string) {
@@ -316,6 +327,7 @@ func (s *Udp) sendFileToClient(clientId uint16, filepath string) {
 	buffer := make([]byte, CHUNKSIZE)
 	seq := uint32(0)
 	addr := s.clientManger.GetClient(clientId)
+	doneChan := make(chan bool)
 
 	for {
 		n, err := file.Read(buffer)
@@ -339,15 +351,13 @@ func (s *Udp) sendFileToClient(clientId uint16, filepath string) {
 			// chunk [seq 4] [fileSize 4] [data n]
 			copy(pkt[offset:], buffer[:n])
 
-			doneChan := make(chan bool)
-
-			s.generateChan <- models.Packet{OpCode: OpFileChunk, Payload: pkt, Addr: addr, ClientID: clientId, Done: doneChan}
-
 			if seq == 0 {
-				fmt.Printf("First Seq: %v", seq)
+				s.generateChan <- models.Packet{OpCode: OpFileChunk, Payload: pkt, Addr: addr, ClientID: clientId, Done: doneChan}
 				if !<-doneChan {
 					break
 				}
+			} else {
+				s.generateChan <- models.Packet{OpCode: OpFileChunk, Payload: pkt, Addr: addr, ClientID: clientId}
 			}
 			// sendedSeq = append(sendedSeq, seq)
 			seq++
