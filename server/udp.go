@@ -279,6 +279,8 @@ func (s *Udp) sendWithAck(packet models.Packet) error {
 	for i := 0; i < retries; i++ {
 
 		s.writeChan <- packet
+		time.Sleep(2 * time.Millisecond) // 👈 helps throttle sending rate
+
 		select {
 		case <-ackCh:
 			if packet.Done != nil {
@@ -359,7 +361,6 @@ func (s *Udp) sendFileToClient(clientId uint16, filepath string) {
 				s.generateChan <- models.Packet{OpCode: OpFileChunk, Payload: pkt, Addr: addr, ClientID: clientId}
 			}
 
-			time.Sleep(2 * time.Millisecond) // 👈 helps throttle sending rate
 			seq++
 		}
 		if err == io.EOF {
