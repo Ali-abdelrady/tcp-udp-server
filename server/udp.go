@@ -31,7 +31,7 @@ type Udp struct {
 
 const (
 	BUFFER_SIZE = 65507
-	CHUNKSIZE   = 10000
+	CHUNKSIZE   = 60000
 )
 
 // OPCODES
@@ -332,8 +332,8 @@ func (s *Udp) sendFileToClient(clientId uint16, filepath string) {
 	doneChan := make(chan bool, 1)
 	fileId := utils.GenerateTimestampID()
 
-	// Build Meta Packet and send it waiting for ack 
-	
+	// Build Meta Packet and send it waiting for ack
+
 	for {
 		n, err := file.Read(buffer)
 
