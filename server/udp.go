@@ -12,7 +12,6 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -24,8 +23,10 @@ type Udp struct {
 	trackingChan chan models.Packet
 
 	clientManger workers.ClientManager
-	pendingAck   map[uint32]chan bool
-	pendingMutex sync.Mutex
+	ackManger    *workers.AckManager
+
+	// pendingAck   map[uint32]chan bool
+	// pendingMutex sync.Mutex
 }
 
 const (
@@ -66,8 +67,9 @@ func (s *Udp) StartServer() {
 	s.parserChan = make(chan models.RawPacket, 50)
 	s.generateChan = make(chan models.Packet, 50)
 	s.clientManger = *workers.NewClientManager()
-	s.trackingChan = make(chan models.Packet, 100)
-	s.pendingAck = make(map[uint32]chan bool)
+	s.ackManger = workers.NewAckManager()
+	s.trackingChan = make(chan models.Packet, 200)
+	// s.pendingAck = make(map[uint32]chan bool)
 
 	// Run Workers
 	for i := 0; i < 4; i++ {
@@ -92,7 +94,10 @@ func (s *Udp) StartServer() {
 			continue
 		}
 
-		s.parserChan <- models.RawPacket{Data: buffer[:n], Addr: addr}
+		dataCopy := make([]byte, n)
+		copy(dataCopy, buffer[:n])
+
+		s.parserChan <- models.RawPacket{Data: dataCopy, Addr: addr}
 	}
 
 }
@@ -251,11 +256,8 @@ func (s *Udp) handleAck(packet models.Packet) {
 
 	// fmt.Printf("[Server] Got ACK for packet ID = %v \n", packet.ID)
 
-	s.pendingMutex.Lock()
-	ch, ok := s.pendingAck[packet.ID]
-	s.pendingMutex.Unlock()
-
-	if ok {
+	ch := s.ackManger.GetAck(packet.ID)
+	if ch != nil {
 		ch <- true
 	}
 }
@@ -263,31 +265,28 @@ func (s *Udp) handleAck(packet models.Packet) {
 func (s *Udp) sendWithAck(packet models.Packet) error {
 	retries := 3
 
-	internalAck := make(chan bool, 1)
+	// Register a pending acknowledgment channel
+	s.ackManger.AddAck(packet.ID)
 
-	s.pendingMutex.Lock()
-	s.pendingAck[packet.ID] = internalAck
-	s.pendingMutex.Unlock()
+	ackCh := s.ackManger.GetAck(packet.ID)
+	if ackCh == nil {
+		return fmt.Errorf("failed to create ack channel for packet %d", packet.ID)
+	}
 
 	// fmt.Println("pendingAck:", s.pendingAck)
-	defer func() {
-		s.pendingMutex.Lock()
-		delete(s.pendingAck, packet.ID)
-		s.pendingMutex.Unlock()
-	}()
+	defer s.ackManger.DeleteAck(packet.ID)
 
 	for i := 0; i < retries; i++ {
 
 		s.writeChan <- packet
-
 		select {
-		case <-internalAck:
+		case <-ackCh:
 			if packet.Done != nil {
 				packet.Done <- true
 			}
 			fmt.Printf("ACK received for packet %d\n", packet.ID)
 			return nil
-		case <-time.After(4 * time.Second):
+		case <-time.After(1 * time.Second):
 			fmt.Printf("Timeout for packet %d, retrying...\n", packet.ID)
 		}
 	}
@@ -327,7 +326,7 @@ func (s *Udp) sendFileToClient(clientId uint16, filepath string) {
 	buffer := make([]byte, CHUNKSIZE)
 	seq := uint32(0)
 	addr := s.clientManger.GetClient(clientId)
-	doneChan := make(chan bool)
+	doneChan := make(chan bool, 1)
 
 	for {
 		n, err := file.Read(buffer)
@@ -359,7 +358,8 @@ func (s *Udp) sendFileToClient(clientId uint16, filepath string) {
 			} else {
 				s.generateChan <- models.Packet{OpCode: OpFileChunk, Payload: pkt, Addr: addr, ClientID: clientId}
 			}
-			// sendedSeq = append(sendedSeq, seq)
+
+			time.Sleep(2 * time.Millisecond) // 👈 helps throttle sending rate
 			seq++
 		}
 		if err == io.EOF {
