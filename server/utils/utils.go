@@ -2,19 +2,20 @@ package utils
 
 import (
 	"crypto/rand"
+	"encoding/binary"
 	"time"
 )
 
 func GenerateTimestampID() uint32 {
-	timestamp := uint32(time.Now().UnixNano())
+	// Use milliseconds for longer wrap-around (≈49 days)
+	timestamp := uint32(time.Now().UnixNano() / 1e6)
 
-	var randByte [1]byte
-	_, err := rand.Read(randByte[:])
-	if err != nil {
-		panic("failed to generate random byte: " + err.Error())
+	var randBytes [2]byte
+	if _, err := rand.Read(randBytes[:]); err != nil {
+		panic("failed to generate random bytes: " + err.Error())
 	}
-	randomSuffix := uint32(randByte[0])
+	randomPart := binary.BigEndian.Uint16(randBytes[:])
 
-	// Combine: upper 24 bits = timestamp, lower 8 bits = random
-	return (timestamp << 8) | randomSuffix
+	// Combine: upper 16 bits = timestamp, lower 16 bits = random
+	return (timestamp << 16) | uint32(randomPart)
 }

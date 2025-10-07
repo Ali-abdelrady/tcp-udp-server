@@ -157,11 +157,12 @@ func (s *Udp) generatorWorker() {
 			packetID = utils.GenerateTimestampID()
 		}
 
-		// Packet [opcode 1] [packetId 4] [payload n]
-		buf := make([]byte, 1+4+len(packet.Payload))
+		// Packet [opcode 1] [packetId 4] [clientId 2] [payload n]
+		buf := make([]byte, 1+4+2+len(packet.Payload))
 		buf[0] = packet.OpCode
 		binary.BigEndian.PutUint32(buf[1:5], packetID)
-		copy(buf[5:], packet.Payload)
+		binary.BigEndian.PutUint16(buf[5:7], packet.ClientID)
+		copy(buf[7:], packet.Payload)
 
 		// fmt.Printf("Sended Packet ID : %v\n", packetID)
 		outgoingPacket := models.Packet{Payload: buf, Addr: packet.Addr, ID: packetID, Done: packet.Done}
@@ -329,27 +330,32 @@ func (s *Udp) sendFileToClient(clientId uint16, filepath string) {
 	seq := uint32(0)
 	addr := s.clientManger.GetClient(clientId)
 	doneChan := make(chan bool, 1)
+	fileId := utils.GenerateTimestampID()
 
+	// Build Meta Packet and send it waiting for ack 
+	
 	for {
 		n, err := file.Read(buffer)
 
 		if n > 0 {
 
-			offset := 4
+			// [fileId 4] [seq 4] = 8 //? for seq != 0
+			offset := 8
 
 			if seq == 0 {
-				offset = 8
+				offset = 12
 			}
 
 			// allocate enough space for header + data
 			pkt := make([]byte, offset+n)
-			binary.BigEndian.PutUint32(pkt[:4], seq)
+			binary.BigEndian.PutUint32(pkt[:4], fileId)
+			binary.BigEndian.PutUint32(pkt[4:8], seq)
 
 			if seq == 0 {
-				binary.BigEndian.PutUint32(pkt[4:8], uint32(fileSize))
+				binary.BigEndian.PutUint32(pkt[8:12], uint32(fileSize))
 			}
 
-			// chunk [seq 4] [fileSize 4] [data n]
+			// chunk [fileId 4] [seq 4] [fileSize 4] [data n]
 			copy(pkt[offset:], buffer[:n])
 
 			if seq == 0 {
