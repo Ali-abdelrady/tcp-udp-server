@@ -31,7 +31,7 @@ type Udp struct {
 
 const (
 	BUFFER_SIZE = 65507
-	CHUNKSIZE   = 50000
+	CHUNKSIZE   = 40000
 )
 
 // OPCODES
