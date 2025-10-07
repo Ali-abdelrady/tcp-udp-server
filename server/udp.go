@@ -24,9 +24,6 @@ type Udp struct {
 
 	clientManger workers.ClientManager
 	ackManger    *workers.AckManager
-
-	// pendingAck   map[uint32]chan bool
-	// pendingMutex sync.Mutex
 }
 
 const (
@@ -180,55 +177,112 @@ func (s *Udp) generatorWorker() {
 
 func (s *Udp) startInteractiveCommandInput() {
 	scanner := bufio.NewScanner(os.Stdin)
+
+	fmt.Println("🟢 UDP Command Interface Started")
+	fmt.Println("Available commands:")
+	fmt.Println("  message <clientId> <message>")
+	fmt.Println("  file <clientId> <filepath>")
+	fmt.Println("  list")
+	fmt.Println("  help")
+	fmt.Println("------------------------------")
+
 	for {
-		fmt.Print("Enter <clientId> <operation> <message/filepath(optional)>: ")
+		fmt.Print("> ")
+
 		if !scanner.Scan() {
-			fmt.Println("input scanner closed")
+			fmt.Println("\n❌ Input closed. Exiting interactive mode.")
 			return
 		}
 
-		line := scanner.Text()
-		parts := strings.SplitN(line, " ", 3)
-		if len(parts) < 2 {
-			fmt.Println("please enter: <clientId> <operation> <message/filepath(optional)>")
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
 			continue
 		}
 
-		clientID := parts[0]
-		operation := parts[1]
-		var payload string
-		if len(parts) == 3 {
-			payload = parts[2]
-		}
+		parts := strings.SplitN(line, " ", 3)
+		command := strings.ToLower(parts[0])
 
-		switch operation {
+		switch command {
+
+		// send message <clientId> <message>
 		case "message":
-			if payload == "" {
-				fmt.Println("please provide a message")
+			if len(parts) < 3 {
+				fmt.Println("⚠ Usage: message <clientId> <text>")
 				continue
 			}
-			s.sendMessageToClient(clientID, payload)
 
-		case "file":
-			// if payload == "" {
-			// 	fmt.Println("please provide a file path")
-			// 	continue
-			// }
-			parsedClientID, err := strconv.ParseUint(clientID, 10, 16)
+			clientID, err := strconv.ParseUint(parts[1], 10, 16)
 			if err != nil {
-				fmt.Println("Invalid clientID input", err)
-				return
+				fmt.Println("❌ Invalid client ID:", err)
+				continue
 			}
-			s.sendFileToClient(uint16(parsedClientID), "./image.jpg")
+
+			msg := parts[2]
+			s.sendMessageToClient(string(clientID), msg)
+
+		// send file <clientId> <path>
+		case "file":
+			if len(parts) < 3 {
+				fmt.Println("⚠ Usage: file <clientId> <filepath>")
+				continue
+			}
+
+			clientID, err := strconv.ParseUint(parts[1], 10, 16)
+			if err != nil {
+				fmt.Println("❌ Invalid client ID:", err)
+				continue
+			}
+
+			filepath := parts[2]
+			if _, err := os.Stat(filepath); err != nil {
+				fmt.Println("❌ File not found:", filepath)
+				continue
+			}
+
+			s.sendFileToClient(uint16(clientID), filepath)
+
+		// list all clients
+		case "list":
+			clients := s.clientManger.ListClients()
+
+			if len(clients) == 0 {
+				fmt.Println("⚠ No connected clients.")
+				continue
+			}
+
+			fmt.Println("==== Connected Clients ====")
+			for id, client := range clients {
+				status := "🟢"
+				if !client.IsOnline {
+					status = "🔴"
+				}
+
+				fmt.Printf("%s ID: %d | Addr: %-21v | LastSeen: %v | Online: %v\n",
+					status, id, client.Addr, client.LastSeen.Format("15:04:05"), client.IsOnline)
+			}
+			fmt.Println("============================")
+
+		// show help
+		case "help":
+			fmt.Println("Available commands:")
+			fmt.Println("  message <clientId> <message>   - send a message to client")
+			fmt.Println("  file <clientId> <path>         - send a file to client")
+			fmt.Println("  list                           - show connected clients")
+			fmt.Println("  help                           - show this help message")
 
 		default:
-			fmt.Printf("unknown operation: %s\n", operation)
+			fmt.Printf("❌ Unknown command: '%s' (type 'help' for list)\n", command)
 		}
 	}
 }
 
 func (s *Udp) pingClient(packet models.Packet) {
-	s.clientManger.AddClient(packet.ClientID, packet.Addr)
+	addr := s.clientManger.GetClient(packet.ClientID)
+	if addr == nil {
+		s.clientManger.AddClient(packet.ClientID, packet.Addr)
+	} else {
+		s.clientManger.PingClient(packet.ClientID)
+	}
 
 	msg := fmt.Sprintf("Ping ack for client%d", int(packet.ClientID))
 
