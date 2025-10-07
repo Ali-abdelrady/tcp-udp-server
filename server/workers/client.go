@@ -1,6 +1,16 @@
 package workers
 
-import "net"
+import (
+	"net"
+	"time"
+)
+
+type Client struct {
+	ID       uint32
+	Addr     *net.UDPAddr
+	LastSeen time.Time
+	IsOnline bool
+}
 
 type clientOp struct {
 	action   string
