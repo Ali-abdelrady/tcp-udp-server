@@ -281,8 +281,7 @@ func (s *Udp) sendWithAck(packet models.Packet) error {
 
 		s.writeChan <- packet
 		// time.Sleep(2 * time.Millisecond) // 👈 helps throttle sending rate
-		return nil
-		
+
 		select {
 		case <-ackCh:
 			if packet.Done != nil {
