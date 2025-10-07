@@ -289,7 +289,7 @@ func (s *Udp) sendWithAck(packet models.Packet) error {
 			}
 			fmt.Printf("ACK received for packet %d\n", packet.ID)
 			return nil
-		case <-time.After(1 * time.Second):
+		case <-time.After(5 * time.Second):
 			fmt.Printf("Timeout for packet %d, retrying...\n", packet.ID)
 		}
 	}
