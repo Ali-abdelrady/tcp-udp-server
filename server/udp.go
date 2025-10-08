@@ -179,15 +179,14 @@ func (s *Udp) generatorWorker() {
 func (s *Udp) startInteractiveCommandInput() {
 	scanner := bufio.NewScanner(os.Stdin)
 
-	fmt.Println("🟢 UDP Command Interface Started")
-	fmt.Println("Available commands:")
-	fmt.Println("  message <clientId> <message>")
-	fmt.Println("  file <clientId> <filepath>")
-	fmt.Println("  list")
-	fmt.Println("  help")
-	fmt.Println("------------------------------")
-
 	for {
+		fmt.Println("🟢 UDP Command Interface Started")
+		fmt.Println("Available commands:")
+		fmt.Println("  message <clientId> <message>")
+		fmt.Println("  file <clientId> <filepath>")
+		fmt.Println("  list")
+		fmt.Println("  help")
+		fmt.Println("------------------------------")
 		fmt.Print("> ")
 
 		if !scanner.Scan() {
