@@ -50,6 +50,7 @@ func (s *Udp) StartServer() {
 		os.Exit(1)
 	}
 
+	fmt.Println("Chunk Size:", CHUNKSIZE)
 	// Start listening
 	connection, err := net.ListenUDP("udp4", udpAddr)
 	if err != nil {
