@@ -73,11 +73,12 @@ func (s *Udp) StartServer() {
 	// s.pendingAck = make(map[uint32]chan bool)
 
 	// Run Workers
-
-	go s.parserWorker()
-	go s.writeWorker(connection)
-	go s.generatorWorker()
-	go s.trackingWorker()
+	for i := 0; i < 3; i++ {
+		go s.parserWorker()
+		go s.writeWorker(connection)
+		go s.generatorWorker()
+		go s.trackingWorker()
+	}
 	go s.startInteractiveCommandInput()
 
 	buffer := make([]byte, BUFFER_SIZE)
