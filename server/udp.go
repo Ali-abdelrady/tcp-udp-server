@@ -22,6 +22,7 @@ type Udp struct {
 	generateChan chan models.Packet
 	trackingChan chan models.Packet
 
+	fileManger   *workers.FileManger
 	clientManger workers.ClientManager
 	ackManger    *workers.AckManager
 }
@@ -50,7 +51,6 @@ func (s *Udp) StartServer() {
 		os.Exit(1)
 	}
 
-	fmt.Println("Chunk Size:", CHUNKSIZE)
 	// Start listening
 	connection, err := net.ListenUDP("udp4", udpAddr)
 	if err != nil {
@@ -64,19 +64,20 @@ func (s *Udp) StartServer() {
 	s.writeChan = make(chan models.Packet, 50)
 	s.parserChan = make(chan models.RawPacket, 50)
 	s.generateChan = make(chan models.Packet, 50)
+	s.trackingChan = make(chan models.Packet, 200)
+
 	s.clientManger = *workers.NewClientManager()
 	s.ackManger = workers.NewAckManager()
-	s.trackingChan = make(chan models.Packet, 200)
+	s.fileManger = workers.NewFileManger()
+
 	// s.pendingAck = make(map[uint32]chan bool)
 
 	// Run Workers
-	for i := 0; i < 4; i++ {
-		go s.parserWorker()
-		go s.writeWorker(connection)
-		go s.generatorWorker()
-		go s.trackingWorker()
-	}
 
+	go s.parserWorker()
+	go s.writeWorker(connection)
+	go s.generatorWorker()
+	go s.trackingWorker()
 	go s.startInteractiveCommandInput()
 
 	buffer := make([]byte, BUFFER_SIZE)
@@ -134,8 +135,10 @@ func (s *Udp) parserWorker() {
 			s.pingClient(packet)
 		case OpRegister:
 			s.registerClient(packet)
-			// case OpDownload:
-			// 	s.downloadFile(packet)
+		case OpMessage:
+			s.handleReceiveMessage(packet)
+		case OpFileChunk:
+			s.handleReceiveFile(packet)
 		}
 	}
 }
@@ -447,4 +450,45 @@ func (s *Udp) sendMessageToClient(clientID, msg string) {
 	addr := s.clientManger.GetClient(uint16(parsedClientID))
 
 	s.generateChan <- models.Packet{OpCode: OpMessage, Payload: []byte(msg), Addr: addr}
+}
+
+func (s *Udp) handleReceiveMessage(packet models.Packet) {
+	fmt.Printf("[Client%d] >> %s", packet.ClientID, packet.Payload)
+
+	// Send Ack back to client
+	newPacket := packet
+	newPacket.OpCode = OpAck
+	newPacket.Payload = []byte(fmt.Sprintf("Recived %s", string(packet.Payload)))
+	s.generateChan <- newPacket
+}
+
+func (s *Udp) handleReceiveFile(packet models.Packet) {
+	fileId := binary.BigEndian.Uint32(packet.Payload[:4])
+	seq := binary.BigEndian.Uint32(packet.Payload[4:8])
+	var fileData []byte
+	var fileSize uint32
+
+	if seq == 0 {
+		fileSize = binary.BigEndian.Uint32(packet.Payload[8:12])
+		fileData = make([]byte, len(packet.Payload[12:]))
+		copy(fileData, packet.Payload[12:])
+	} else {
+		fileData = make([]byte, len(packet.Payload[8:]))
+		copy(fileData, packet.Payload[8:])
+	}
+
+	chunk := workers.FileChunk{
+		FileID:   fileId,
+		Seq:      seq,
+		FileSize: fileSize,
+		Data:     fileData,
+	}
+
+	s.fileManger.Ops <- chunk
+
+	//  Always send ACK back to Client
+	outgoingPacket := packet
+	outgoingPacket.OpCode = OpAck
+	outgoingPacket.Payload = []byte{}
+	s.generateChan <- outgoingPacket
 }
