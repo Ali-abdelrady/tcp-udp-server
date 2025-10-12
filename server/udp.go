@@ -29,7 +29,7 @@ type Udp struct {
 
 const (
 	BUFFER_SIZE = 65507
-	CHUNKSIZE   = 65000
+	CHUNKSIZE   = 10000
 )
 
 // OPCODES
@@ -216,14 +216,10 @@ func (s *Udp) startInteractiveCommandInput() {
 				continue
 			}
 
-			clientID, err := strconv.ParseUint(parts[1], 10, 16)
-			if err != nil {
-				fmt.Println("❌ Invalid client ID:", err)
-				continue
-			}
+			clientID := parts[1]
 
 			msg := parts[2]
-			s.sendMessageToClient(string(clientID), msg)
+			s.sendMessageToClient(clientID, msg)
 
 		// send file <clientId> <path>
 		case "file":
@@ -437,7 +433,7 @@ func (s *Udp) sendFileToClient(clientId uint16, filepath string) {
 		}
 	}
 	// fmt.Println("Seq:", sendedSeq)
-	fmt.Printf("File sent successfully. Size: %.2f KB\n", float64(fileSize))
+	// fmt.Printf("File sent successfully. Size: %.2f KB\n", float64(fileSize))
 }
 
 func (s *Udp) sendMessageToClient(clientID, msg string) {
