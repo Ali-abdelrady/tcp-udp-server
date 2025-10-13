@@ -15,6 +15,7 @@ type FileChunk struct {
 	Seq      uint32
 	FileSize uint32
 	Data     []byte
+	ClientID uint16
 }
 
 type FileSession struct {
@@ -47,7 +48,7 @@ func (fm *FileManger) run() {
 
 		// Create new session for new fileId
 		if !exists && chunk.Seq == 0 {
-			fmt.Printf("Recieved First Seq = %v , fileId = %v , fileSize = %v\n", chunk.Seq, chunk.FileID, chunk.FileSize)
+			fmt.Printf("Recieved From Client%d First Seq = %v , fileId = %v , fileSize = %v\n", chunk.ClientID, chunk.Seq, chunk.FileID, chunk.FileSize)
 			// Save file in project root
 			wd, err := os.Getwd()
 			if err != nil {
@@ -55,7 +56,7 @@ func (fm *FileManger) run() {
 				return
 			}
 
-			filePath := filepath.Join(wd, fmt.Sprintf("file_%d.csv", chunk.FileID))
+			filePath := filepath.Join(wd, fmt.Sprintf("client%d_%d.csv", chunk.ClientID, chunk.FileID))
 			file, err := os.Create(filePath)
 			if err != nil {
 				fmt.Println("Error creating file:", err)
@@ -96,10 +97,10 @@ func (fm *FileManger) handleFile(session *FileSession) {
 		offset := int64(chunk.Seq) * int64(CHUNKSIZE)
 		session.File.WriteAt(chunk.Data, offset)
 		session.Received += uint32(len(chunk.Data))
-		fmt.Printf("Recieved (%d/%d) seq = %d \n", session.Received, session.Expected, chunk.Seq)
+		fmt.Printf("Recieved From Client%d (%d/%d) seq = %d \n", chunk.ClientID, session.Received, session.Expected, chunk.Seq)
 
 		if session.Received >= session.Expected {
-			fmt.Printf("✅ File %d done (%.2f KB)\n", chunk.FileID, float64(session.Expected)/1024)
+			fmt.Printf("✅ Client%d File %d done (%.2f KB)\n", chunk.ClientID, chunk.FileID, float64(session.Expected)/1024)
 			session.File.Close()
 			close(session.ChunkChan)
 			delete(fm.files, chunk.FileID)
@@ -107,4 +108,3 @@ func (fm *FileManger) handleFile(session *FileSession) {
 		}
 	}
 }
-

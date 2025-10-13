@@ -173,7 +173,6 @@ func (s *Udp) generatorWorker() {
 				Done:    packet.Done,
 			}
 			// Forward ACK/PONG without creating new buffer
-			fmt.Printf("Send Ack To PacketID =  %d , Size = %d\n", packetID, len(buf))
 			s.writeChan <- outgoing
 		default:
 			buf := make([]byte, 1+4+2+2+len(packet.Payload)) // fixed missing +2
@@ -492,6 +491,7 @@ func (s *Udp) handleReceiveFile(packet models.Packet) {
 		Seq:      seq,
 		FileSize: fileSize,
 		Data:     fileData,
+		ClientID: packet.ClientID,
 	}
 
 	s.fileManger.Ops <- chunk
