@@ -156,26 +156,38 @@ func (s *Udp) generatorWorker() {
 			packetID = utils.GenerateTimestampID()
 		}
 
-		buf := make([]byte, 1+4+2+2+len(packet.Payload)) // fixed missing +2
-		buf[0] = packet.OpCode
-		binary.BigEndian.PutUint32(buf[1:5], packetID)
-		binary.BigEndian.PutUint16(buf[5:7], uint16(len(buf)))
-		binary.BigEndian.PutUint16(buf[7:9], packet.ClientID)
-		copy(buf[9:], packet.Payload)
-
-		outgoing := models.Packet{
-			Payload: buf,
-			Addr:    packet.Addr,
-			ID:      packetID,
-			Done:    packet.Done,
-		}
-
 		switch packet.OpCode {
 		case OpAck, OpPong:
+			buf := make([]byte, 1+4+2+2+len(packet.Payload)) // fixed missing +2
+			buf[0] = packet.OpCode
+			binary.BigEndian.PutUint32(buf[1:5], packetID)
+			binary.BigEndian.PutUint16(buf[5:7], uint16(len(buf)))
+			binary.BigEndian.PutUint16(buf[7:9], packet.ClientID)
+			// copy(buf[9:], packet.Payload)
+
+			outgoing := models.Packet{
+				Payload: buf,
+				Addr:    packet.Addr,
+				ID:      packetID,
+				Done:    packet.Done,
+			}
 			// Forward ACK/PONG without creating new buffer
-			fmt.Printf("Send Ack To PacketID =  %d , Size = %d\n",packetID,len(buf))
+			fmt.Printf("Send Ack To PacketID =  %d , Size = %d\n", packetID, len(buf))
 			s.writeChan <- outgoing
 		default:
+			buf := make([]byte, 1+4+2+2+len(packet.Payload)) // fixed missing +2
+			buf[0] = packet.OpCode
+			binary.BigEndian.PutUint32(buf[1:5], packetID)
+			binary.BigEndian.PutUint16(buf[5:7], uint16(len(buf)))
+			binary.BigEndian.PutUint16(buf[7:9], packet.ClientID)
+			copy(buf[9:], packet.Payload)
+
+			outgoing := models.Packet{
+				Payload: buf,
+				Addr:    packet.Addr,
+				ID:      packetID,
+				Done:    packet.Done,
+			}
 			// Packet [opcode 1] [packetId 4] [size 2] [clientId 2] [payload n]
 			s.trackingChan <- outgoing
 		}
