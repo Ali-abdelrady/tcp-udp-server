@@ -75,10 +75,10 @@ func (s *Udp) StartServer() {
 	// Run Workers
 	for i := 0; i < 3; i++ {
 		go s.parserWorker()
-		go s.writeWorker(connection)
 		go s.generatorWorker()
 		go s.trackingWorker()
 	}
+	go s.writeWorker(connection)
 	go s.startInteractiveCommandInput()
 
 	buffer := make([]byte, BUFFER_SIZE)
@@ -173,8 +173,8 @@ func (s *Udp) generatorWorker() {
 		switch packet.OpCode {
 		case OpAck, OpPong:
 			// Forward ACK/PONG without creating new buffer
+			fmt.Printf("Send Ack To PacketID =  %d , Size = %d\n",packetID,len(buf))
 			s.writeChan <- outgoing
-
 		default:
 			// Packet [opcode 1] [packetId 4] [size 2] [clientId 2] [payload n]
 			s.trackingChan <- outgoing
