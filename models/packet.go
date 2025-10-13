@@ -24,6 +24,7 @@ type Packet struct {
 	ClientID uint16
 	OpCode   byte
 	Done     chan bool
+	Length   uint16
 }
 
 type RawPacket struct {

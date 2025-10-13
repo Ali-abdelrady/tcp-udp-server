@@ -127,6 +127,7 @@ func (s *Udp) parserWorker() {
 			ClientID: binary.BigEndian.Uint16(raw.Data[5:7]),
 			Payload:  raw.Data[7:],
 			Addr:     raw.Addr,
+			Length:   uint16(len(raw.Data)),
 		}
 
 		switch packet.OpCode {
@@ -148,35 +149,36 @@ func (s *Udp) generatorWorker() {
 	for {
 		packet := <-s.generateChan
 
-		// [opcode] [packetId] [payload n]
 		var packetID uint32
-
-		if packet.OpCode == OpAck {
-			// use client packetID
+		if packet.OpCode == OpAck || packet.OpCode == OpPong {
 			packetID = packet.ID
 		} else {
-			// Generate New one
 			packetID = utils.GenerateTimestampID()
 		}
 
-		// Packet [opcode 1] [packetId 4] [clientId 2] [payload n]
-		buf := make([]byte, 1+4+2+len(packet.Payload))
+		buf := make([]byte, 1+4+2+2+len(packet.Payload)) // fixed missing +2
 		buf[0] = packet.OpCode
 		binary.BigEndian.PutUint32(buf[1:5], packetID)
-		binary.BigEndian.PutUint16(buf[5:7], packet.ClientID)
-		copy(buf[7:], packet.Payload)
+		binary.BigEndian.PutUint16(buf[5:7], uint16(len(buf)))
+		binary.BigEndian.PutUint16(buf[7:9], packet.ClientID)
+		copy(buf[9:], packet.Payload)
 
-		// fmt.Printf("Sended Packet ID : %v\n", packetID)
-		outgoingPacket := models.Packet{Payload: buf, Addr: packet.Addr, ID: packetID, Done: packet.Done}
-
-		if packet.OpCode == OpAck {
-			// use client packetID
-			s.writeChan <- outgoingPacket
-		} else {
-			// Generate New one
-			s.trackingChan <- outgoingPacket
+		outgoing := models.Packet{
+			Payload: buf,
+			Addr:    packet.Addr,
+			ID:      packetID,
+			Done:    packet.Done,
 		}
 
+		switch packet.OpCode {
+		case OpAck, OpPong:
+			// Forward ACK/PONG without creating new buffer
+			s.writeChan <- outgoing
+
+		default:
+			// Packet [opcode 1] [packetId 4] [size 2] [clientId 2] [payload n]
+			s.trackingChan <- outgoing
+		}
 	}
 }
 
@@ -285,12 +287,9 @@ func (s *Udp) pingClient(packet models.Packet) {
 		s.clientManger.PingClient(packet.ClientID)
 	}
 
-	msg := fmt.Sprintf("Ping ack for client%d", int(packet.ClientID))
-
 	newPacket := packet
-	newPacket.OpCode = OpAck
-	newPacket.Payload = []byte(msg)
-
+	newPacket.OpCode = OpPong
+	newPacket.Length = uint16(len(packet.Payload))
 	s.generateChan <- newPacket
 }
 
@@ -302,6 +301,7 @@ func (s *Udp) registerClient(packet models.Packet) {
 
 	newPacket := packet
 	newPacket.OpCode = OpAck
+	newPacket.Length = uint16(len(packet.Payload))
 	newPacket.Payload = []byte(msg)
 
 	s.generateChan <- newPacket
@@ -486,6 +486,7 @@ func (s *Udp) handleReceiveFile(packet models.Packet) {
 	//  Always send ACK back to Client
 	outgoingPacket := packet
 	outgoingPacket.OpCode = OpAck
-	outgoingPacket.Payload = []byte{}
+	outgoingPacket.Length = uint16(len(packet.Payload))
+	// outgoingPacket.Payload = []byte{}
 	s.generateChan <- outgoingPacket
 }

@@ -72,7 +72,7 @@ func (cm *ClientManager) run() {
 				if client.IsOnline && now.Sub(client.LastSeen) > 28*time.Second {
 					client.IsOnline = false
 					cm.clients[id] = client
-					fmt.Printf("⚠ Client %d marked offline (no ping for 20s)\n", id)
+					fmt.Printf("⚠ Client %d marked offline (no ping for 28s)\n", id)
 				}
 			}
 		}
