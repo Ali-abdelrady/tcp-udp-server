@@ -78,6 +78,7 @@ func (s *Udp) StartServer() {
 		go s.generatorWorker()
 		go s.trackingWorker()
 	}
+
 	go s.writeWorker(connection)
 	go s.startInteractiveCommandInput()
 
