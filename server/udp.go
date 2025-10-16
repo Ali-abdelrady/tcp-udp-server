@@ -10,8 +10,10 @@ import (
 	"io"
 	"net"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -82,6 +84,20 @@ func (s *Udp) StartServer() {
 	go s.writeWorker(connection)
 	go s.startInteractiveCommandInput()
 
+	// 🔹 Defer log for graceful shutdown
+	defer utils.PrintApiLog("Server Shutdown")
+
+	// 🔹 Setup signal handling (Ctrl+C, kill, etc.)
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+
+	go func() {
+		<-sigChan
+		fmt.Println("\n🛑 Shutting down server gracefully...")
+		utils.PrintApiLog("Server Exit")
+		os.Exit(0)
+	}()
+	
 	buffer := make([]byte, BUFFER_SIZE)
 
 	for {
