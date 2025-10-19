@@ -247,10 +247,12 @@ func (s *Udp) fileManagerWorker() {
 
 		if exists {
 			session = val.(*models.ReceiveSession)
+			session.ChunkChan <- chunk
+
 		}
 
 		// Create new session for new fileId
-		if !exists && chunk.Seq == 0 {
+		if !exists && chunk.MetaSent {
 
 			wd, err := os.Getwd()
 			if err != nil {
@@ -289,7 +291,6 @@ func (s *Udp) fileManagerWorker() {
 			continue
 		}
 
-		session.ChunkChan <- chunk
 	}
 }
 
@@ -641,6 +642,7 @@ func (s *Udp) handleFileMeta(packet models.Packet) {
 		FileSize: fileSize,
 		Data:     []byte(fileName),
 		ClientID: clientID,
+		MetaSent: true,
 	}
 
 	s.fileChunksChan <- chunk
@@ -665,10 +667,12 @@ func (s *Udp) handleFileChunk(packet models.Packet) {
 
 	s.fileChunksChan <- chunk
 
-	// Send ACK
-	// ack := packet
-	// ack.OpCode = OpAck
-	// s.generateChan <- ack
+	// Mark as chunk recieved
+	ch := s.ackManger.GetAck(packet.ID)
+	if ch != nil {
+		ch <- true
+	}
+
 }
 
 // func (s *Udp) handleReceiveFile(packet models.Packet) {

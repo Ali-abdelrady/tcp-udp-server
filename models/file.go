@@ -12,6 +12,7 @@ type FileChunk struct {
 	// FileName string
 	Data     []byte
 	ClientID uint16
+	MetaSent bool
 }
 
 type ReceiveSession struct {
