@@ -15,7 +15,7 @@ func main() {
 
 	port := ":" + args[1]
 
-	server := server.Udp{Port: port}
+	server := server.NewUdp(port)
 
 	server.StartServer()
 

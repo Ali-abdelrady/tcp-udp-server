@@ -7,24 +7,30 @@ import (
 
 type FileChunk struct {
 	FileID   uint32
-	Seq      uint32
-	FileSize uint32
-	// FileName string
+	Seq      uint16
 	Data     []byte
 	ClientID uint16
-	MetaSent bool
+}
+
+type FileMeta struct {
+	FileID    uint32
+	FileSize  uint32
+	FileName  []byte
+	ChunkSize uint16
+	ClientID  uint16
 }
 
 type ReceiveSession struct {
 	File       *os.File
 	FileID     uint32
 	FileName   string
-	Expected   uint32
-	Received   uint32
-	TotalChunk uint32
-	Chunks     map[uint32]bool
+	Expected   uint16
+	Received   uint16
+	TotalChunk uint16
+	Chunks     map[uint16]bool
 	ChunkChan  chan FileChunk
 	ClientID   uint16
+	ChunkSize  uint16
 }
 
 type SendSession struct {
@@ -32,6 +38,6 @@ type SendSession struct {
 	File        *os.File
 	FileSize    uint32
 	FileName    string
-	TotalChunks uint32
+	TotalChunks uint16
 	CreatedAt   time.Time // ⬅ added
 }
