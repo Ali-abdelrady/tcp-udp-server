@@ -21,7 +21,7 @@ import (
 
 const (
 	BUFFER_SIZE = 65507
-	CHUNKSIZE   = 50000
+	CHUNKSIZE   = 5000
 	HEADER_SIZE = 7 // [opcode 1] [packetID 4] [ClientID 2]
 )
 
@@ -697,6 +697,7 @@ func (s *Udp) RequestFileChunks(session *models.ReceiveSession) {
 		select {
 		case resp = <-session.AckChan:
 			// response received
+			fmt.Println("Recieved Chuck ACk")
 		case <-timeout.C:
 			fmt.Printf("⏱ Timeout waiting for chunk %d, sending status query...\n", seq)
 			s.sendChunkStatusRequest(packet)
