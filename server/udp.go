@@ -23,19 +23,20 @@ const (
 	BUFFER_SIZE = 65507
 	CHUNKSIZE   = 1400
 	HEADER_SIZE = 7 // [opcode 1] [packetID 4] [ClientID 2]
-
 )
 
 // OPCODES
 const (
-	OpRegister     byte = iota // 0
-	OpPing                     // 1
-	OpMessage                  // 2
-	OpPong                     // 3
-	OpFileChunk                // 4
-	OpAck                      //5
-	OpFileMeta                 //6
-	OpChunkRequest             //7
+	OpRegister            byte = iota // 0
+	OpPing                            // 1
+	OpMessage                         // 2
+	OpPong                            // 3
+	OpFileChunk                       // 4
+	OpAck                             //5
+	OpFileMeta                        //6
+	OpChunkRequest                    //7
+	OpChunkStatusRequest              // 8
+	OpChunkStatusResponse             // 9
 )
 
 type Udp struct {
@@ -176,6 +177,11 @@ func (s *Udp) parserWorker() {
 			s.onFileChunkReceived(packet)
 		case OpChunkRequest:
 			s.onChunkRequestReceived(packet)
+		case OpChunkStatusRequest:
+			s.onChunkStatusRequestReceived(packet)
+		case OpChunkStatusResponse:
+			s.onChunkStatusResponseReceived(packet)
+
 		}
 	}
 }
@@ -185,7 +191,7 @@ func (s *Udp) generatorWorker() {
 		packet := <-s.generateChan
 
 		var packetID uint32
-		isUnreliable := packet.OpCode == OpAck || packet.OpCode == OpPong || packet.OpCode == OpFileChunk
+		isUnreliable := packet.OpCode == OpAck || packet.OpCode == OpPong || packet.OpCode == OpFileChunk || packet.OpCode == OpChunkStatusResponse
 
 		if isUnreliable {
 			packetID = packet.ID
@@ -202,13 +208,13 @@ func (s *Udp) generatorWorker() {
 			Done:    packet.Done,
 		}
 
-		if isUnreliable {
-			// Send ACKs/PONGS/CHUNKS directly
+		switch packet.OpCode {
+		case OpMessage, OpFileMeta:
+			s.sendWithAck(outgoing)
+		default:
 			s.writeChan <- outgoing
-		} else {
-			// Send all other packets (Meta, Message, Request) to tracker for ACK handling
-			s.trackingChan <- outgoing
 		}
+
 	}
 }
 
@@ -239,6 +245,7 @@ func (s *Udp) fileMetaWorker() {
 }
 
 // Handles incoming file chunks (writes them to disk)
+
 func (s *Udp) fileChunkWorker() {
 	for chunk := range s.fileChunksChan {
 		s.appendFileChunk(chunk)
@@ -416,6 +423,11 @@ func (s *Udp) onChunkRequestReceived(packet models.Packet) {
 		return
 	}
 
+	if session.SentChunks == nil {
+		session.SentChunks = make(map[uint16]time.Time)
+	}
+	session.SentChunks[seq] = time.Now()
+
 	//[fileID 4] [seq 2] [payload n]
 	resp := make([]byte, 6+n)
 	binary.BigEndian.PutUint32(resp[0:4], fileID)
@@ -479,7 +491,67 @@ func (s *Udp) onFileChunkReceived(packet models.Packet) {
 	if ch != nil {
 		ch <- true
 	}
+}
 
+func (s *Udp) onChunkStatusResponseReceived(packet models.Packet) {
+	fileID := binary.BigEndian.Uint32(packet.Payload[:4])
+	seq := binary.BigEndian.Uint16(packet.Payload[4:6])
+	status := packet.Payload[6]
+
+	// Send ACk
+	ch := s.ackManger.GetAck(packet.ID)
+	if ch != nil {
+		ch <- true
+	}
+
+	val, ok := s.receivedFiles.Load(fileID)
+	if !ok {
+		fmt.Printf("⚠️ No active session found for FileID=%d\n", fileID)
+		return
+	}
+
+	session := val.(*models.ReceiveSession)
+
+	// Push response into the session’s AckChan
+	select {
+	case session.AckChan <- models.AckResponse{Seq: seq, Status: status}:
+		// sent successfully to listener
+	default:
+		fmt.Printf("⚠️ AckChan full, dropping status response for FileID=%d Seq=%d\n", fileID, seq)
+	}
+}
+
+func (s *Udp) onChunkStatusRequestReceived(packet models.Packet) {
+	fileID := binary.BigEndian.Uint32(packet.Payload[:4])
+	seq := binary.BigEndian.Uint16(packet.Payload[4:6])
+
+	status := byte(3) // Default: Not Found
+
+	if val, ok := s.sendOutFiles.Load(fileID); ok {
+		session := val.(*models.SendSession)
+
+		// Ensure map exists
+		if session.SentChunks == nil {
+			session.SentChunks = make(map[uint16]time.Time)
+		}
+
+		if _, exists := session.SentChunks[seq]; exists {
+			status = 2 // Already Sent
+		} else {
+			status = 0 // Not Sent
+		}
+	}
+
+	resp := make([]byte, 7)
+	binary.BigEndian.PutUint32(resp[0:4], fileID)
+	binary.BigEndian.PutUint16(resp[4:6], seq)
+	resp[6] = status
+
+	response := packet
+	response.OpCode = OpChunkStatusResponse
+	response.Payload = resp
+
+	s.generateChan <- response
 }
 
 // ---------Senders---------
@@ -500,7 +572,7 @@ func (s *Udp) sendWithAck(packet models.Packet) error {
 	for i := 0; i < retries; i++ {
 
 		s.writeChan <- packet
-		time.Sleep(1 * time.Millisecond) // 👈 helps throttle sending rate
+		// time.Sleep(1 * time.Millisecond) // 👈 helps throttle sending rate
 
 		select {
 		case <-ackCh:
@@ -550,8 +622,8 @@ func (s *Udp) sendFileMeta(clientId uint16, path string) {
 	fileSize := stat.Size()
 	fileName := filepath.Base(path)
 	doneChan := make(chan bool, 1)
-	// totalChunks := uint32((fileSize + CHUNKSIZE - 1) / CHUNKSIZE)
 
+	// Store the sendout files
 	s.sendOutFiles.Store(fileId, &models.SendSession{File: file, FileID: fileId, FileSize: uint32(fileSize), FileName: fileName, CreatedAt: time.Now()})
 
 	// Build Buffer [fileId 4] [fileSize 4] [ChunkSize 2] [filename n]
@@ -573,33 +645,97 @@ func (s *Udp) sendFileMeta(clientId uint16, path string) {
 
 }
 
+func (s *Udp) sendChunkStatusRequest(reqPacket models.Packet) {
+
+	fileID := binary.BigEndian.Uint32(reqPacket.Payload[:4])
+	seq := binary.BigEndian.Uint16(reqPacket.Payload[4:6])
+	clientID := reqPacket.ClientID
+	addr := reqPacket.Addr
+
+	fmt.Printf("📡 Sending status request for FileID=%d, Seq=%d\n", fileID, seq)
+
+	// Build payload: [fileID 4][seq 2]
+	buf := make([]byte, 6)
+	binary.BigEndian.PutUint32(buf[0:4], fileID)
+	binary.BigEndian.PutUint16(buf[4:6], seq)
+
+	statusReqPkt := models.Packet{
+		OpCode:   OpChunkStatusRequest,
+		Payload:  buf,
+		ClientID: clientID,
+		Addr:     addr,
+	}
+
+	s.generateChan <- statusReqPkt
+}
+
 func (s *Udp) RequestFileChunks(session *models.ReceiveSession) {
 	for seq := uint16(0); seq < session.TotalChunk; seq++ {
-		// Prepare request buffer
-		req := make([]byte, 6)
-		binary.BigEndian.PutUint32(req[0:4], session.FileID)
-		binary.BigEndian.PutUint16(req[4:6], seq)
-		addr := s.clientManger.GetClient(session.ClientID)
-		doneChan := make(chan bool, 1)
+		if session.Chunks[seq] {
+			continue // already received
+		}
 
+		fileID := session.FileID
+		addr := s.clientManger.GetClient(session.ClientID)
+
+		fmt.Printf("Requesting chunk %d...\n", seq)
+
+		req := make([]byte, 6)
+		binary.BigEndian.PutUint32(req[0:4], fileID)
+		binary.BigEndian.PutUint16(req[4:6], seq)
 		packet := models.Packet{
 			OpCode:   OpChunkRequest,
 			Payload:  req,
-			Done:     doneChan,
 			Addr:     addr,
 			ClientID: session.ClientID,
 		}
 
 		s.generateChan <- packet
 
-		success := <-doneChan
-		if success {
-			fmt.Printf("✅ Requested chunk %d acknowledged\n", seq)
-		} else {
-			fmt.Printf("⚠️ Chunk %d failed after timeout\n", seq)
+		timeout := time.NewTimer(5 * time.Second)
+		var resp models.AckResponse
+		select {
+		case resp = <-session.AckChan:
+			// response received
+		case <-timeout.C:
+			fmt.Printf("⏱ Timeout waiting for chunk %d, sending status query...\n", seq)
+			s.sendChunkStatusRequest(packet)
+			// Wait again for the status response
+			select {
+			case resp = <-session.AckChan:
+			case <-time.After(3 * time.Second):
+				fmt.Printf("⚠️ No status response for chunk %d, aborting.\n", seq)
+				return
+			}
+		}
+
+		timeout.Stop()
+
+		switch resp.Status {
+		case 100:
+			fmt.Printf("Chunk %d received OK\n", seq)
+			continue
+		case 0: // NotSent
+			fmt.Printf("Chunk %d not sent yet, retrying...\n", seq)
+			seq-- // retry
+			continue
+		case 1: // InProgress
+			fmt.Printf("Chunk %d still being processed, waiting...\n", seq)
+			time.Sleep(2 * time.Second)
+			seq--
+			continue
+		case 2: // AlreadySent
+			fmt.Printf("Chunk %d already sent, retrying...\n", seq)
+			seq--
+			continue
+		case 3: // NotFound
+			fmt.Printf("Chunk %d not found, aborting.\n", seq)
+			return
+		default:
+			fmt.Printf("Unknown status %d for chunk %d\n", resp.Status, seq)
+			return
 		}
 	}
-
 }
 
 //------File Manager Handlers--------
@@ -629,15 +765,12 @@ func (s *Udp) createSessionFromMeta(meta models.FileMeta) {
 
 	// Start new session for the this file
 	session := &models.ReceiveSession{
-		ClientID:  meta.ClientID,
-		File:      file,
-		FileID:    meta.FileID,
-		FileName:  filePath,
-		Received:  0,
-		Chunks:    make(map[uint16]bool),
-		ChunkSize: meta.ChunkSize,
-		// ChunkChan:  make(chan models.FileChunk, 50),
+		FileMeta:   meta,
+		File:       file,
+		Received:   0,
+		Chunks:     make(map[uint16]bool),
 		TotalChunk: uint16((meta.FileSize + uint32(meta.ChunkSize) - 1) / uint32(meta.ChunkSize)),
+		AckChan:    make(chan models.AckResponse, 10),
 	}
 
 	// Store the session
@@ -656,9 +789,16 @@ func (s *Udp) appendFileChunk(chunk models.FileChunk) {
 
 	session := val.(*models.ReceiveSession)
 
+	// Check for duplicates
 	if session.Chunks[chunk.Seq] {
 		fmt.Printf("⚠ Duplicate Seq = %d ignored \n", chunk.Seq)
 		return
+	}
+
+	//
+	session.AckChan <- models.AckResponse{
+		Seq:    chunk.Seq,
+		Status: 200, // ReceivedOK
 	}
 
 	session.Chunks[chunk.Seq] = true
@@ -666,12 +806,13 @@ func (s *Udp) appendFileChunk(chunk models.FileChunk) {
 	offset := int64(chunk.Seq) * int64(session.ChunkSize)
 	session.File.WriteAt(chunk.Data, offset)
 	session.Received++
+
 	fmt.Printf("Recieved From Client%d (%d/%d) seq = %d \n", chunk.ClientID, session.Received, session.TotalChunk, chunk.Seq)
 
 	if session.Received > session.TotalChunk {
 		fmt.Printf("✅ Client%d File %d done \n", chunk.ClientID, chunk.FileID)
 		session.File.Close()
-		close(session.ChunkChan)
+		// close(session.ChunkChan)
 		s.receivedFiles.Delete(chunk.FileID)
 
 		return

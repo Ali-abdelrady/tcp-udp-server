@@ -21,16 +21,14 @@ type FileMeta struct {
 }
 
 type ReceiveSession struct {
+	FileMeta
+
 	File       *os.File
-	FileID     uint32
-	FileName   string
 	Expected   uint16
 	Received   uint16
 	TotalChunk uint16
 	Chunks     map[uint16]bool
-	ChunkChan  chan FileChunk
-	ClientID   uint16
-	ChunkSize  uint16
+	AckChan    chan AckResponse
 }
 
 type SendSession struct {
@@ -39,5 +37,11 @@ type SendSession struct {
 	FileSize    uint32
 	FileName    string
 	TotalChunks uint16
-	CreatedAt   time.Time // ⬅ added
+	SentChunks  map[uint16]time.Time // track chunks that have been sent
+	CreatedAt   time.Time
+}
+
+type AckResponse struct {
+	Seq    uint16
+	Status byte
 }
