@@ -712,7 +712,7 @@ func (s *Udp) RequestFileChunks(session *models.ReceiveSession) {
 		timeout.Stop()
 
 		switch resp.Status {
-		case 100:
+		case 200:
 			fmt.Printf("Chunk %d received OK\n", seq)
 			continue
 		case 0: // NotSent
