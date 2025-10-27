@@ -74,14 +74,17 @@ type Udp struct {
 
 func NewUdp(port string) *Udp {
 	return &Udp{
-		Port:           port,
-		parserChan:     make(chan models.RawPacket, 50),
-		writeChan:      make(chan models.Packet, 50),
-		generateChan:   make(chan models.Packet, 50),
-		ackChan:        make(chan models.Packet, 200),
-		fileChunksChan: make(chan models.FileChunk, 100),
-		fileMetaChan:   make(chan models.FileMeta, 50),
-		clientManger:   *workers.NewClientManager(),
+		Port:                port,
+		parserChan:          make(chan models.RawPacket, 50),
+		writeChan:           make(chan models.Packet, 50),
+		generateChan:        make(chan models.Packet, 50),
+		ackChan:             make(chan models.Packet, 200),
+		fileChunksChan:      make(chan models.FileChunk, 100),
+		fileMetaChan:        make(chan models.FileMeta, 50),
+		clientManger:        *workers.NewClientManager(),
+		congestionWindow:    1,
+		slowStartThreshold:  16,
+		maxCongestionWindow: 64,
 		// ackManger:      workers.NewAckManager(),
 	}
 }
@@ -284,8 +287,12 @@ func (s *Udp) ackListener() {
 			}
 
 			// --- RTT update ---
-			rtt := time.Since(pp.SendTime)
-			s.updateRTT(rtt)
+			var rtt time.Duration
+
+			if pp.Retries == 0 {
+				rtt = time.Since(pp.SendTime)
+				s.updateRTT(rtt)
+			}
 
 			// --- Congestion Control ---
 			if s.congestionWindow < s.slowStartThreshold {
@@ -999,4 +1006,13 @@ func (s *Udp) updateRTT(rtt time.Duration) {
 
 	s.rto = s.smoothedRTT + 4*s.rttVar
 
+}
+
+func (s *Udp) countPendingPackets() int {
+	count := 0
+	s.pendingPackets.Range(func(_, _ any) bool {
+		count++
+		return true
+	})
+	return count
 }
