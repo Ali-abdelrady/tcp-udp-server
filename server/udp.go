@@ -23,6 +23,8 @@ const (
 	BUFFER_SIZE = 65507
 	CHUNKSIZE   = 30000
 	HEADER_SIZE = 7 // [opcode 1] [packetID 4] [ClientID 2]
+	alpha       = 0.125
+	beta        = 0.25
 )
 
 // OPCODES
@@ -45,16 +47,29 @@ type Udp struct {
 	parserChan     chan models.RawPacket
 	writeChan      chan models.Packet
 	generateChan   chan models.Packet
-	trackingChan   chan models.Packet
+	ackChan        chan models.Packet
 	fileMetaChan   chan models.FileMeta
 	fileChunksChan chan models.FileChunk
 
-	receivedFiles sync.Map // map[uint32]*models.ReceiveSession
-	sendOutFiles  sync.Map // map[uint32]*models.SendSession
+	receivedFiles  sync.Map // map[uint32]*models.ReceiveSession
+	sendOutFiles   sync.Map // map[uint32]*models.SendSession
+	pendingPackets sync.Map
 
 	// fileManger   *workers.FileManager
 	clientManger workers.ClientManager
-	ackManger    *workers.AckManager
+	// ackManger    *workers.AckManager
+
+	//? RTT & Retransmission time out
+	smoothedRTT time.Duration
+	rttVar      time.Duration
+	rto         time.Duration
+
+	//? Congestion Control
+	congestionWindow    int // Congestion Window
+	slowStartThreshold  int // start slow threshold
+	maxCongestionWindow int
+	// bytesInFlight       float64
+	ackCount int
 }
 
 func NewUdp(port string) *Udp {
@@ -63,11 +78,11 @@ func NewUdp(port string) *Udp {
 		parserChan:     make(chan models.RawPacket, 50),
 		writeChan:      make(chan models.Packet, 50),
 		generateChan:   make(chan models.Packet, 50),
-		trackingChan:   make(chan models.Packet, 200),
+		ackChan:        make(chan models.Packet, 200),
 		fileChunksChan: make(chan models.FileChunk, 100),
 		fileMetaChan:   make(chan models.FileMeta, 50),
 		clientManger:   *workers.NewClientManager(),
-		ackManger:      workers.NewAckManager(),
+		// ackManger:      workers.NewAckManager(),
 	}
 }
 
@@ -91,17 +106,16 @@ func (s *Udp) StartServer() {
 	// Initialze Buffer Pool
 
 	s.clientManger = *workers.NewClientManager()
-	s.ackManger = workers.NewAckManager()
+	// s.ackManger = workers.NewAckManager()
 
 	// Run Workers
-	for i := 0; i < 3; i++ {
-		go s.parserWorker()
-		go s.generatorWorker()
-		go s.trackingWorker()
-		go s.fileMetaWorker()
-		go s.fileChunkWorker()
-	}
 
+	go s.parserWorker()
+	go s.generatorWorker()
+	go s.fileMetaWorker()
+	go s.fileChunkWorker()
+	go s.retransmissionWorker()
+	go s.ackListener()
 	go s.writeWorker(connection)
 	go s.startInteractiveCommandInput()
 
@@ -135,11 +149,42 @@ func (s *Udp) StartServer() {
 //-----------Workers--------------
 
 func (s *Udp) writeWorker(conn *net.UDPConn) {
-	for pkt := range s.writeChan {
+	for {
+
+		pkt := <-s.writeChan
+
+		if pkt.Addr == nil {
+			fmt.Printf("⚠️ [writeWorker] packet ID=%d has nil address, skipping\n", pkt.ID)
+			continue
+		}
+
 		_, err := conn.WriteToUDP(pkt.Payload, pkt.Addr)
 		if err != nil {
 			fmt.Println("failed to send packet")
+			continue
 		}
+
+		// ✅ mark actual send time
+		if pkt.Trackable {
+			pp := &models.PendingPacket{
+				Packet:   pkt,
+				SendTime: time.Now(),
+				Retries:  0,
+				AckChan:  make(chan bool, 1),
+			}
+			s.pendingPackets.Store(pkt.ID, pp)
+		}
+
+		// pacing
+		interval := 10 * time.Millisecond
+		if s.smoothedRTT > 0 && s.congestionWindow > 0 {
+			pacingRate := float64(s.congestionWindow*CHUNKSIZE) / s.smoothedRTT.Seconds()
+			interval = time.Duration(float64(CHUNKSIZE) / pacingRate * float64(time.Second))
+		} else {
+			interval = 10 * time.Millisecond
+		}
+
+		time.Sleep(interval)
 	}
 }
 
@@ -164,7 +209,7 @@ func (s *Udp) parserWorker() {
 
 		switch packet.OpCode {
 		case OpAck:
-			s.onAckReceived(packet)
+			s.ackChan <- packet
 		case OpPing:
 			s.onPingReceived(packet)
 		case OpRegister:
@@ -191,7 +236,7 @@ func (s *Udp) generatorWorker() {
 		packet := <-s.generateChan
 
 		var packetID uint32
-		isUnreliable := packet.OpCode == OpAck || packet.OpCode == OpPong || packet.OpCode == OpFileChunk || packet.OpCode == OpChunkStatusResponse
+		isUnreliable := packet.OpCode == OpAck || packet.OpCode == OpPong || packet.OpCode == OpChunkStatusResponse
 
 		if isUnreliable {
 			packetID = packet.ID
@@ -201,19 +246,15 @@ func (s *Udp) generatorWorker() {
 
 		finalPayload := s.buildPacketPayload(packet, packetID)
 
-		outgoing := models.Packet{
-			Payload: finalPayload,
-			Addr:    packet.Addr,
-			ID:      packetID,
-			Done:    packet.Done,
+		outgoingPacket := models.Packet{
+			Payload:   finalPayload,
+			Addr:      packet.Addr,
+			ID:        packetID,
+			Done:      packet.Done,
+			Trackable: !isUnreliable,
 		}
 
-		switch packet.OpCode {
-		case OpMessage, OpFileMeta:
-			s.sendWithAck(outgoing)
-		default:
-			s.writeChan <- outgoing
-		}
+		s.writeChan <- outgoingPacket
 
 	}
 }
@@ -229,12 +270,105 @@ func (s *Udp) buildPacketPayload(packet models.Packet, packetID uint32) []byte {
 	return buf
 }
 
-func (s *Udp) trackingWorker() {
-	for packet := range s.trackingChan {
-		err := s.sendWithAck(packet)
-		if err != nil {
-			fmt.Printf("[Tracking] Failed to deliver packet %d after retries\n", packet.ID)
+func (s *Udp) ackListener() {
+	for {
+		ackPkt := <-s.ackChan
+
+		// Find pending packet
+		if value, ok := s.pendingPackets.LoadAndDelete(ackPkt.ID); ok {
+
+			pp := value.(*models.PendingPacket)
+			pp.AckChan <- true
+			if pp.Packet.Done != nil {
+				pp.Packet.Done <- true
+			}
+
+			// --- RTT update ---
+			rtt := time.Since(pp.SendTime)
+			s.updateRTT(rtt)
+
+			// --- Congestion Control ---
+			if s.congestionWindow < s.slowStartThreshold {
+				// Slow start: exponential growth
+				s.congestionWindow *= 2
+				fmt.Printf("🚀 Slow Start: cwnd doubled to %d\n", s.congestionWindow)
+			} else {
+				// Congestion avoidance: linear growth (1 packet per RTT)
+				s.ackCount++
+				if s.ackCount >= s.congestionWindow {
+					s.congestionWindow++
+					s.ackCount = 0
+					fmt.Printf("📈 Linear Growth: cwnd increased to %d\n", s.congestionWindow)
+				}
+			}
+
+			// Clamp cwnd to prevent runaway growth
+			if s.congestionWindow > s.maxCongestionWindow {
+				s.congestionWindow = s.maxCongestionWindow
+			}
+
+			// --- Remove from pending ---
+
+			// s.pendingPackets.Delete(ackPkt.ID)
+
+			// --- Logging ---
+			fmt.Printf(
+				"✅ ACK %v | RTT: %v | Smoothed: %v | Var: %v | RTO: %v | cwnd: %d | ssthresh: %d\n",
+				pp.Packet.ID,
+				rtt,
+				s.smoothedRTT,
+				s.rttVar,
+				s.rto,
+				s.congestionWindow,
+				s.slowStartThreshold,
+			)
 		}
+	}
+}
+
+func (s *Udp) retransmissionWorker() {
+	maxRetries := 3
+	ticker := time.NewTicker(200 * time.Millisecond) // check more frequently
+
+	for range ticker.C {
+		now := time.Now()
+
+		s.pendingPackets.Range(func(key, value any) bool {
+			pp := value.(*models.PendingPacket)
+
+			// Get latest adaptive RTO
+			baseTimeout := s.rto * 5
+			if baseTimeout == 0 {
+				baseTimeout = 500 * time.Millisecond // default before any RTT samples
+			}
+
+			nextRetryDelay := baseTimeout * time.Duration(1<<pp.Retries)
+
+			// Check if timeout expired
+			if now.Sub(pp.SendTime) > nextRetryDelay && pp.Retries < maxRetries {
+				fmt.Printf("⏱️ Retrying packet %d (attempt %d, timeout=%v)\n",
+					pp.Packet.ID, pp.Retries+1, baseTimeout)
+
+				// Retransmit
+				s.writeChan <- pp.Packet
+				pp.SendTime = now
+				pp.Retries++
+
+			} else if pp.Retries >= maxRetries {
+				fmt.Printf("❌ Packet %d failed after %d retries\n", pp.Packet.ID, pp.Retries)
+				s.pendingPackets.Delete(pp.Packet.ID)
+
+				// Congestion reaction
+				s.slowStartThreshold = max(2, s.congestionWindow/2)
+				s.congestionWindow = 1
+
+				if pp.Packet.Done != nil {
+					pp.Packet.Done <- false
+				}
+			}
+
+			return true
+		})
 	}
 }
 
@@ -350,16 +484,6 @@ func (s *Udp) startInteractiveCommandInput() {
 }
 
 // --------Parser Handlers--------
-
-func (s *Udp) onAckReceived(packet models.Packet) {
-
-	// fmt.Printf("[Server] Got ACK for packet ID = %v \n", packet.ID)
-
-	ch := s.ackManger.GetAck(packet.ID)
-	if ch != nil {
-		ch <- true
-	}
-}
 
 func (s *Udp) onPingReceived(packet models.Packet) {
 	addr := s.clientManger.GetClient(packet.ClientID)
@@ -486,11 +610,16 @@ func (s *Udp) onFileChunkReceived(packet models.Packet) {
 
 	s.fileChunksChan <- chunk
 
+	newPacket := packet
+	newPacket.OpCode = OpAck
+	newPacket.Payload = []byte{}
+	s.generateChan <- newPacket
+
 	// Mark as chunk recieved
-	ch := s.ackManger.GetAck(packet.ID)
-	if ch != nil {
-		ch <- true
-	}
+	// ch := s.ackManger.GetAck(packet.ID)
+	// if ch != nil {
+	// 	ch <- true
+	// }
 }
 
 func (s *Udp) onChunkStatusResponseReceived(packet models.Packet) {
@@ -499,10 +628,11 @@ func (s *Udp) onChunkStatusResponseReceived(packet models.Packet) {
 	status := packet.Payload[6]
 
 	// Send ACk
-	ch := s.ackManger.GetAck(packet.ID)
-	if ch != nil {
-		ch <- true
-	}
+	s.ackChan <- packet
+	// ch := s.ackManger.GetAck(packet.ID)
+	// if ch != nil {
+	// 	ch <- true
+	// }
 
 	val, ok := s.receivedFiles.Load(fileID)
 	if !ok {
@@ -555,44 +685,6 @@ func (s *Udp) onChunkStatusRequestReceived(packet models.Packet) {
 }
 
 // ---------Senders---------
-func (s *Udp) sendWithAck(packet models.Packet) error {
-	retries := 3
-
-	// Register a pending acknowledgment channel
-	s.ackManger.AddAck(packet.ID)
-
-	ackCh := s.ackManger.GetAck(packet.ID)
-	if ackCh == nil {
-		return fmt.Errorf("failed to create ack channel for packet %d", packet.ID)
-	}
-
-	// fmt.Println("pendingAck:", s.pendingAck)
-	defer s.ackManger.DeleteAck(packet.ID)
-
-	for i := 0; i < retries; i++ {
-
-		s.writeChan <- packet
-		// time.Sleep(1 * time.Millisecond) // 👈 helps throttle sending rate
-
-		select {
-		case <-ackCh:
-			if packet.Done != nil {
-				packet.Done <- true
-			}
-			fmt.Printf("ACK received for packet %d\n", packet.ID)
-			return nil
-		case <-time.After(5 * time.Second):
-			fmt.Printf("Timeout for packet %d, retrying...\n", packet.ID)
-		}
-	}
-
-	if packet.Done != nil {
-		packet.Done <- false
-	}
-
-	return fmt.Errorf("failed to deliver packet %d", packet.ID)
-
-}
 
 func (s *Udp) sendMessageToClient(clientID, msg string) {
 
@@ -613,6 +705,8 @@ func (s *Udp) sendFileMeta(clientId uint16, path string) {
 		fmt.Println("falied to open file with path: ", "./message", err)
 		return
 	}
+	defer file.Close()
+
 	// Client addr
 	addr := s.clientManger.GetClient(clientId)
 
@@ -643,6 +737,41 @@ func (s *Udp) sendFileMeta(clientId uint16, path string) {
 
 	s.generateChan <- pkt
 
+	if !<-doneChan {
+		fmt.Println("Didn't recive the meta ack")
+		return
+	}
+
+	time.Sleep(1 * time.Microsecond)
+
+	seq := uint16(0)
+	chunk := make([]byte, CHUNKSIZE)
+
+	for {
+		n, err := file.Read(chunk)
+
+		if n > 0 {
+
+			//  [fileId 4] [seq 2]
+			payload := make([]byte, 6+n)
+			binary.BigEndian.PutUint32(payload[:4], fileId)
+			binary.BigEndian.PutUint16(payload[4:6], seq)
+			copy(payload[6:], chunk[:n])
+
+			s.generateChan <- models.Packet{OpCode: OpFileChunk, Payload: payload, ClientID: clientId, Addr: addr}
+
+			seq++
+		}
+
+		if err == io.EOF {
+			break
+		}
+
+		if err != nil {
+			fmt.Println("failed to read files")
+			return
+		}
+	}
 }
 
 func (s *Udp) sendChunkStatusRequest(reqPacket models.Packet) {
@@ -778,7 +907,7 @@ func (s *Udp) createSessionFromMeta(meta models.FileMeta) {
 	s.receivedFiles.Store(meta.FileID, session)
 
 	// Start Req for file chunks
-	s.RequestFileChunks(session)
+	// s.RequestFileChunks(session)
 }
 
 func (s *Udp) appendFileChunk(chunk models.FileChunk) {
@@ -797,10 +926,10 @@ func (s *Udp) appendFileChunk(chunk models.FileChunk) {
 	}
 
 	//
-	session.AckChan <- models.AckResponse{
-		Seq:    chunk.Seq,
-		Status: 200, // ReceivedOK
-	}
+	// session.AckChan <- models.AckResponse{
+	// 	Seq:    chunk.Seq,
+	// 	Status: 200, // ReceivedOK
+	// }
 
 	session.Chunks[chunk.Seq] = true
 
@@ -851,4 +980,23 @@ func (s *Udp) setupGracfulShutdown() {
 		utils.PrintApiLog("Server Exit")
 		os.Exit(0)
 	}()
+}
+
+func (s *Udp) updateRTT(rtt time.Duration) {
+	// Update the RTT
+	if s.smoothedRTT == 0 {
+		s.smoothedRTT = rtt
+		s.rttVar = rtt / 2
+	} else {
+		rttDiff := s.smoothedRTT - rtt
+		if rttDiff < 0 {
+			rttDiff = -rttDiff
+		}
+
+		s.rttVar = time.Duration((1-beta)*float64(s.rttVar) + beta*float64(rttDiff))
+		s.smoothedRTT = time.Duration((1-alpha)*float64(s.smoothedRTT) + alpha*float64(rtt))
+	}
+
+	s.rto = s.smoothedRTT + 4*s.rttVar
+
 }
