@@ -337,7 +337,7 @@ func (s *Udp) retransmissionWorker() {
 			pp := value.(*models.PendingPacket)
 
 			// Get latest adaptive RTO
-			baseTimeout := s.rto * 5
+			baseTimeout := s.rto
 			if baseTimeout == 0 {
 				baseTimeout = 500 * time.Millisecond // default before any RTT samples
 			}
