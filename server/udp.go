@@ -21,7 +21,7 @@ import (
 
 const (
 	BUFFER_SIZE = 65507
-	CHUNKSIZE   = 30000
+	CHUNKSIZE   = 1400
 	HEADER_SIZE = 7 // [opcode 1] [packetID 4] [ClientID 2]
 	alpha       = 0.125
 	beta        = 0.25
