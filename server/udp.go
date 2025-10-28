@@ -60,31 +60,31 @@ type Udp struct {
 	// ackManger    *workers.AckManager
 
 	//? RTT & Retransmission time out
-	smoothedRTT time.Duration
-	rttVar      time.Duration
-	rto         time.Duration
+	// smoothedRTT time.Duration
+	// rttVar      time.Duration
+	// rto         time.Duration
 
 	//? Congestion Control
-	congestionWindow    int // Congestion Window
-	slowStartThreshold  int // start slow threshold
-	maxCongestionWindow int
-	// bytesInFlight       float64
-	ackCount int
+	// congestionWindow    int // Congestion Window
+	// slowStartThreshold  int // start slow threshold
+	// maxCongestionWindow int
+	// // bytesInFlight       float64
+	// ackCount int
 }
 
 func NewUdp(port string) *Udp {
 	return &Udp{
-		Port:                port,
-		parserChan:          make(chan models.RawPacket, 50),
-		writeChan:           make(chan models.Packet, 50),
-		generateChan:        make(chan models.Packet, 50),
-		ackChan:             make(chan models.Packet, 200),
-		fileChunksChan:      make(chan models.FileChunk, 100),
-		fileMetaChan:        make(chan models.FileMeta, 50),
-		clientManger:        *workers.NewClientManager(),
-		congestionWindow:    1,
-		slowStartThreshold:  16,
-		maxCongestionWindow: 64,
+		Port:           port,
+		parserChan:     make(chan models.RawPacket, 50),
+		writeChan:      make(chan models.Packet, 50),
+		generateChan:   make(chan models.Packet, 50),
+		ackChan:        make(chan models.Packet, 200),
+		fileChunksChan: make(chan models.FileChunk, 100),
+		fileMetaChan:   make(chan models.FileMeta, 50),
+		clientManger:   *workers.NewClientManager(),
+		// congestionWindow:    1,
+		// slowStartThreshold:  16,
+		// maxCongestionWindow: 64,
 		// ackManger:      workers.NewAckManager(),
 	}
 }
@@ -178,16 +178,6 @@ func (s *Udp) writeWorker(conn *net.UDPConn) {
 			s.pendingPackets.Store(pkt.ID, pp)
 		}
 
-		// pacing
-		interval := 10 * time.Millisecond
-		if s.smoothedRTT > 0 && s.congestionWindow > 0 {
-			pacingRate := float64(s.congestionWindow*CHUNKSIZE) / s.smoothedRTT.Seconds()
-			interval = time.Duration(float64(CHUNKSIZE) / pacingRate * float64(time.Second))
-		} else {
-			interval = 10 * time.Millisecond
-		}
-
-		time.Sleep(interval)
 	}
 }
 
@@ -239,7 +229,7 @@ func (s *Udp) generatorWorker() {
 		packet := <-s.generateChan
 
 		var packetID uint32
-		isUnreliable := packet.OpCode == OpAck || packet.OpCode == OpPong || packet.OpCode == OpChunkStatusResponse
+		isUnreliable := packet.OpCode == OpAck || packet.OpCode == OpPong || packet.OpCode == OpChunkStatusResponse || packet.OpCode == OpFileChunk
 
 		if isUnreliable {
 			packetID = packet.ID
@@ -286,55 +276,17 @@ func (s *Udp) ackListener() {
 				pp.Packet.Done <- true
 			}
 
-			// --- RTT update ---
-			var rtt time.Duration
-
-			if pp.Retries == 0 {
-				rtt = time.Since(pp.SendTime)
-				s.updateRTT(rtt)
-			}
-
-			// --- Congestion Control ---
-			if s.congestionWindow < s.slowStartThreshold {
-				// Slow start: exponential growth
-				s.congestionWindow *= 2
-				fmt.Printf("🚀 Slow Start: cwnd doubled to %d\n", s.congestionWindow)
-			} else {
-				// Congestion avoidance: linear growth (1 packet per RTT)
-				s.ackCount++
-				if s.ackCount >= s.congestionWindow {
-					s.congestionWindow++
-					s.ackCount = 0
-					fmt.Printf("📈 Linear Growth: cwnd increased to %d\n", s.congestionWindow)
-				}
-			}
-
-			// Clamp cwnd to prevent runaway growth
-			if s.congestionWindow > s.maxCongestionWindow {
-				s.congestionWindow = s.maxCongestionWindow
-			}
-
-			// --- Remove from pending ---
-
-			// s.pendingPackets.Delete(ackPkt.ID)
-
 			// --- Logging ---
-			fmt.Printf(
-				"✅ ACK %v | RTT: %v | Smoothed: %v | Var: %v | RTO: %v | cwnd: %d | ssthresh: %d\n",
-				pp.Packet.ID,
-				rtt,
-				s.smoothedRTT,
-				s.rttVar,
-				s.rto,
-				s.congestionWindow,
-				s.slowStartThreshold,
-			)
+			fmt.Printf("Packet %v\n", pp.Packet.ID)
+
 		}
 	}
 }
 
 func (s *Udp) retransmissionWorker() {
 	maxRetries := 3
+	timeout := time.Second
+
 	ticker := time.NewTicker(200 * time.Millisecond) // check more frequently
 
 	for range ticker.C {
@@ -343,18 +295,10 @@ func (s *Udp) retransmissionWorker() {
 		s.pendingPackets.Range(func(key, value any) bool {
 			pp := value.(*models.PendingPacket)
 
-			// Get latest adaptive RTO
-			baseTimeout := s.rto
-			if baseTimeout == 0 {
-				baseTimeout = 500 * time.Millisecond // default before any RTT samples
-			}
-
-			nextRetryDelay := baseTimeout * time.Duration(1<<pp.Retries)
-
 			// Check if timeout expired
-			if now.Sub(pp.SendTime) > nextRetryDelay && pp.Retries < maxRetries {
+			if now.Sub(pp.SendTime) > timeout && pp.Retries < maxRetries {
 				fmt.Printf("⏱️ Retrying packet %d (attempt %d, timeout=%v)\n",
-					pp.Packet.ID, pp.Retries+1, baseTimeout)
+					pp.Packet.ID, pp.Retries+1, timeout)
 
 				// Retransmit
 				s.writeChan <- pp.Packet
@@ -364,10 +308,6 @@ func (s *Udp) retransmissionWorker() {
 			} else if pp.Retries >= maxRetries {
 				fmt.Printf("❌ Packet %d failed after %d retries\n", pp.Packet.ID, pp.Retries)
 				s.pendingPackets.Delete(pp.Packet.ID)
-
-				// Congestion reaction
-				s.slowStartThreshold = max(2, s.congestionWindow/2)
-				s.congestionWindow = 1
 
 				if pp.Packet.Done != nil {
 					pp.Packet.Done <- false
@@ -602,8 +542,9 @@ func (s *Udp) onFileMetaReceived(packet models.Packet) {
 }
 
 func (s *Udp) onFileChunkReceived(packet models.Packet) {
-	// [fileId 4] [seq 4] [filename n]
+	s.ackChan <- packet
 
+	// [fileId 4] [seq 4] [filename n]
 	fileId := binary.BigEndian.Uint32(packet.Payload[:4])
 	seq := binary.BigEndian.Uint16(packet.Payload[4:6])
 	fileData := append([]byte{}, packet.Payload[6:]...)
@@ -617,16 +558,6 @@ func (s *Udp) onFileChunkReceived(packet models.Packet) {
 
 	s.fileChunksChan <- chunk
 
-	newPacket := packet
-	newPacket.OpCode = OpAck
-	newPacket.Payload = []byte{}
-	s.generateChan <- newPacket
-
-	// Mark as chunk recieved
-	// ch := s.ackManger.GetAck(packet.ID)
-	// if ch != nil {
-	// 	ch <- true
-	// }
 }
 
 func (s *Udp) onChunkStatusResponseReceived(packet models.Packet) {
@@ -636,10 +567,6 @@ func (s *Udp) onChunkStatusResponseReceived(packet models.Packet) {
 
 	// Send ACk
 	s.ackChan <- packet
-	// ch := s.ackManger.GetAck(packet.ID)
-	// if ch != nil {
-	// 	ch <- true
-	// }
 
 	val, ok := s.receivedFiles.Load(fileID)
 	if !ok {
@@ -712,7 +639,6 @@ func (s *Udp) sendFileMeta(clientId uint16, path string) {
 		fmt.Println("falied to open file with path: ", "./message", err)
 		return
 	}
-	defer file.Close()
 
 	// Client addr
 	addr := s.clientManger.GetClient(clientId)
@@ -744,41 +670,6 @@ func (s *Udp) sendFileMeta(clientId uint16, path string) {
 
 	s.generateChan <- pkt
 
-	if !<-doneChan {
-		fmt.Println("Didn't recive the meta ack")
-		return
-	}
-
-	time.Sleep(1 * time.Microsecond)
-
-	seq := uint16(0)
-	chunk := make([]byte, CHUNKSIZE)
-
-	for {
-		n, err := file.Read(chunk)
-
-		if n > 0 {
-
-			//  [fileId 4] [seq 2]
-			payload := make([]byte, 6+n)
-			binary.BigEndian.PutUint32(payload[:4], fileId)
-			binary.BigEndian.PutUint16(payload[4:6], seq)
-			copy(payload[6:], chunk[:n])
-
-			s.generateChan <- models.Packet{OpCode: OpFileChunk, Payload: payload, ClientID: clientId, Addr: addr}
-
-			seq++
-		}
-
-		if err == io.EOF {
-			break
-		}
-
-		if err != nil {
-			fmt.Println("failed to read files")
-			return
-		}
-	}
 }
 
 func (s *Udp) sendChunkStatusRequest(reqPacket models.Packet) {
@@ -914,7 +805,7 @@ func (s *Udp) createSessionFromMeta(meta models.FileMeta) {
 	s.receivedFiles.Store(meta.FileID, session)
 
 	// Start Req for file chunks
-	// s.RequestFileChunks(session)
+	s.RequestFileChunks(session)
 }
 
 func (s *Udp) appendFileChunk(chunk models.FileChunk) {
@@ -933,10 +824,10 @@ func (s *Udp) appendFileChunk(chunk models.FileChunk) {
 	}
 
 	//
-	// session.AckChan <- models.AckResponse{
-	// 	Seq:    chunk.Seq,
-	// 	Status: 200, // ReceivedOK
-	// }
+	session.AckChan <- models.AckResponse{
+		Seq:    chunk.Seq,
+		Status: 200, // ReceivedOK
+	}
 
 	session.Chunks[chunk.Seq] = true
 
@@ -989,30 +880,21 @@ func (s *Udp) setupGracfulShutdown() {
 	}()
 }
 
-func (s *Udp) updateRTT(rtt time.Duration) {
-	// Update the RTT
-	if s.smoothedRTT == 0 {
-		s.smoothedRTT = rtt
-		s.rttVar = rtt / 2
-	} else {
-		rttDiff := s.smoothedRTT - rtt
-		if rttDiff < 0 {
-			rttDiff = -rttDiff
-		}
+// func (s *Udp) updateRTT(rtt time.Duration) {
+// 	// Update the RTT
+// 	if s.smoothedRTT == 0 {
+// 		s.smoothedRTT = rtt
+// 		s.rttVar = rtt / 2
+// 	} else {
+// 		rttDiff := s.smoothedRTT - rtt
+// 		if rttDiff < 0 {
+// 			rttDiff = -rttDiff
+// 		}
 
-		s.rttVar = time.Duration((1-beta)*float64(s.rttVar) + beta*float64(rttDiff))
-		s.smoothedRTT = time.Duration((1-alpha)*float64(s.smoothedRTT) + alpha*float64(rtt))
-	}
+// 		s.rttVar = time.Duration((1-beta)*float64(s.rttVar) + beta*float64(rttDiff))
+// 		s.smoothedRTT = time.Duration((1-alpha)*float64(s.smoothedRTT) + alpha*float64(rtt))
+// 	}
 
-	s.rto = s.smoothedRTT + 4*s.rttVar
+// 	s.rto = s.smoothedRTT + 4*s.rttVar
 
-}
-
-func (s *Udp) countPendingPackets() int {
-	count := 0
-	s.pendingPackets.Range(func(_, _ any) bool {
-		count++
-		return true
-	})
-	return count
-}
+// }
