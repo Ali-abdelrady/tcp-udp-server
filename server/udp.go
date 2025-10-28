@@ -112,11 +112,12 @@ func (s *Udp) StartServer() {
 	// s.ackManger = workers.NewAckManager()
 
 	// Run Workers
-
-	go s.parserWorker()
-	go s.generatorWorker()
+	for i := 0; i < 3; i++ {
+		go s.parserWorker()
+		go s.generatorWorker()
+		go s.fileChunkWorker()
+	}
 	go s.fileMetaWorker()
-	go s.fileChunkWorker()
 	go s.retransmissionWorker()
 	go s.ackListener()
 	go s.writeWorker(connection)
